@@ -30,11 +30,38 @@ which allocates an
 [`ActiveStream`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_manager_impl.h#L145) and links it into the
 manager's `streams_` list. An `ActiveStream` is the per-request universe: the `RequestDecoder`
 the codec pushes frames into, the `FilterManagerCallbacks` the filter chain pushes the response
-back through, a `ScopeTrackedObject` so a crash dump can name the request, and the owner of its
-timers, span, headers and route cache. It holds a
+back through, and a `ScopeTrackedObject` so a crash dump can name the request. It holds a
 [`DownstreamFilterManager`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.h#L1221) by
 value, declared after the header maps because filters may still read those headers while being
 destroyed.
+
+```mermaid
+flowchart TD
+  CD["Codec stream<br/>ResponseEncoder"]
+  AS["ActiveStream<br/>linked into<br/>ConnectionManagerImpl streams_"]
+  OWN["request_headers_, response_headers_<br/>active_span_, timers, cached_route_"]
+  FM["DownstreamFilterManager<br/>filter_manager_"]
+  FIL["decoder_filters_ / encoder_filters_<br/>ActiveStreamDecoderFilter<br/>ActiveStreamEncoderFilter"]
+  BUF[("owned by the FilterManager:<br/>buffered_request_data_<br/>buffered_response_data_")]
+  SI["stream_info_<br/>StreamInfoImpl"]
+  SIDE["filterState(), dynamicMetadata()<br/>UpstreamInfo, DownstreamTiming"]
+
+  CD -. "decodeHeaders(), decodeData()" .-> AS
+  AS -- "response_encoder_<br/>encodeHeaders()" --> CD
+  AS --> OWN
+  AS --> FM
+  FM --> FIL
+  FM -- "stream_info_" --> SI
+  FIL -- "bufferedData()" --> BUF
+  SI --> SIDE
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  class CD,AS,OWN,FM,FIL,BUF,SI,SIDE worker;
+```
+*Figure 6.1 — One stream: what the `ActiveStream` owns. Source:
+[`ActiveStream`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_manager_impl.h#L138),
+[`ConnectionManagerImpl::newStream`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_manager_impl.cc#L410),
+[`DownstreamFilterManager`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.h#L1221).*
 
 For HTTP/1 the codec pauses after a complete message, so `onData` only redispatches when
 `streams_` is empty; back-pressure on a pipelined connection falls out of that. Under HTTP/2
@@ -162,9 +189,44 @@ private `end_stream_`, calls the filter, and interprets the returned
 - `StopIteration` — stop headers here; data and trailers still reach this filter.
 - `ContinueAndDontEndStream` — keep iterating but hide `end_stream`, for a filter that will
   inject a body later.
-- `StopAllIterationAndBuffer` — stop headers, data and trailers, buffering the body.
-- `StopAllIterationAndWatermark` — the same, but push back via watermarks (see
+- `StopAllIterationAndBuffer`, `StopAllIterationAndWatermark` — stop headers, data and trailers,
+  buffering the body; the second pushes back via watermarks (see
   [Chapter 12](./12-buffers-and-io.md)).
+
+```mermaid
+flowchart TD
+  E["FilterManager::decodeHeaders()<br/>FilterManager::encodeHeaders()"]
+  P["commonDecodePrefix() / commonEncodePrefix()<br/>next filter, or current filter if<br/>iterate_from_current_filter_"]
+  C["filter N: decodeHeaders() / encodeHeaders()"]
+  H["commonHandleAfterHeadersCallback()"]
+  D{"FilterHeadersStatus"}
+  S1["StopIteration<br/>iteration_state_ =<br/>StopSingleIteration"]
+  S2["StopAllIterationAndBuffer<br/>StopAllIterationAndWatermark<br/>iteration_state_ = StopAllBuffer<br/>or StopAllWatermark"]
+  B[("buffered_request_data_<br/>buffered_response_data_")]
+  CC["continueDecoding()<br/>continueEncoding()"]
+  CO["commonContinue()<br/>stoppedAll() sets<br/>iterate_from_current_filter_"]
+  R["do1xxHeaders() (encode path)<br/>doHeaders(), doMetadata()<br/>doData(), doTrailers()<br/>canContinue() re-checked<br/>between steps"]
+
+  E -- "AlwaysStartFromNext" --> P
+  P --> C --> H --> D
+  D -- "Continue: entry++" --> C
+  D --> S1
+  D --> S2
+  S2 == "handleDataIfStopAll()<br/>commonHandleBufferData()" ==> B
+  S1 & S2 -.-> CC
+  CC --> CO --> R
+  R -- "decodeData(), decodeTrailers()<br/>CanStartFromCurrent" --> P
+  B == "doData()" ==> R
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  class E,P,C,H,D,S1,S2,B,CC,CO,R worker;
+```
+*Figure 6.2 — How one filter stops the chain and how it restarts it; the encode path runs the
+same code with the reversed prefix. Source:
+[`FilterManager::decodeHeaders`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L592),
+[`commonHandleAfterHeadersCallback`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L165),
+[`commonContinue`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L61),
+[`IterationState`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.h#L218).*
 
 The distinction between "stop" and "stop all" is recorded as an `IterationState` on the
 wrapper, and it decides where iteration resumes:
@@ -176,9 +238,8 @@ into it.
 Resumption is
 [`commonContinue`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L61),
 reached from `continueDecoding()` or `continueEncoding()`. It replays whatever the filter
-missed, in order — 1xx headers, headers, metadata, buffered body, trailers — re-checking
-`canContinue()` between steps, since any of them may have produced a local reply that makes
-further iteration illegal.
+missed, re-checking `canContinue()` between steps, since any of them may have produced a local
+reply that makes further iteration illegal.
 
 Buffering is deliberately minimal: one request buffer, `buffered_request_data_`, shared by all
 decoder filters.
@@ -303,6 +364,41 @@ reset. After that there are three cases, chosen by how far the response has alre
   [`sendDirectLocalReply`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L1193),
   since re-entering filters that are mid-response would corrupt their state machines.
 - Headers already on the wire: nothing can be said, so reset the stream.
+
+```mermaid
+flowchart TD
+  SL["filter N calls sendLocalReply()<br/>DownstreamFilterManager::sendLocalReply()"]
+  AB["decoder_filter_chain_aborted_<br/>= true (or the encoder one,<br/>encoder_filter_chain_aborted_)<br/>filters after N never run"]
+  OL["onLocalReply() on every filter"]
+  D1{"how far has<br/>the response got?"}
+  VFC["prepareLocalReplyViaFilterChain()<br/>in a decode callback, else<br/>sendLocalReplyViaFilterChain()"]
+  EX["executeLocalReplyIfPrepared()<br/>run by the decode loop"]
+  ENC["encodeHeaders(nullptr)<br/>commonEncodePrefix()<br/>returns begin()"]
+  DIR["sendDirectLocalReply()<br/>filters bypassed"]
+  CODEC["ActiveStream::encodeHeaders()<br/>response_encoder_"]
+  RST["resetStream()"]
+
+  SL --> AB --> OL
+  OL -- "reset_imminent_" --> RST
+  OL --> D1
+  D1 -- "no headers yet" --> VFC
+  D1 -- "set, not encoded" --> DIR
+  D1 -- "on the wire" --> RST
+  VFC -. "prepared" .-> EX
+  VFC -- "sent inline" --> ENC
+  EX --> ENC
+  ENC --> CODEC
+  DIR --> CODEC
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  class SL,AB,OL,D1,VFC,EX,ENC,DIR,CODEC,RST worker;
+```
+*Figure 6.3 — A local reply cuts the decoder chain and picks one of three exits; a filter
+vetoing in `onLocalReply()` is a fourth. Source:
+[`DownstreamFilterManager::sendLocalReply`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L1026),
+[`onLocalReply`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L1014),
+[`prepareLocalReplyViaFilterChain`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L1105),
+[`sendDirectLocalReply`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L1193).*
 
 Even the first case has a re-entrancy problem: the reply is usually raised from inside a
 decoder filter's callback, and encoding there would run the encoder chain underneath the

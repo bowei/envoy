@@ -27,10 +27,36 @@ The concrete implementation is [`OwnedImpl`](https://github.com/envoyproxy/envoy
 base_     base_+data_    base_+        base_+capacity_
                          reservable_
 ```
+*Figure 12.1 — The three offsets into one slice's storage. Source:
+[`Slice`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.h#L37).*
+
+A buffer is a deque of those slices, in arrival order:
+
+```
+OwnedImpl A            slices_:  front ---------------> back
+
+  +---------+--------+  +-----------------+  +--------+------------+
+  | drained | data   |  | data            |  | data   | reservable |
+  +---------+--------+  +-----------------+  +--------+------------+
+   drain() moved         full: nothing        tail: append() and
+   data_ forward         left to reserve      reserve() write here
+
+  A.length() = dataSize() of slice 0 + slice 1 + slice 2
+
+  B.move(A) pops each slice off A's front in order, and for each one:
+
+      under 512 bytes, owns its storage, and B's tail has room?
+        yes -> the bytes are copied into B's tail slice
+        no  -> B takes ownership of the whole Slice, nothing copied
+```
+*Figure 12.2 — A buffer as a deque of slices, and what move() transfers.
+Source: [`OwnedImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.h#L643),
+[`OwnedImpl::move`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.cc#L334),
+[`OwnedImpl::coalesceOrAddSlice`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.cc#L312).*
 
 Draining from the front just advances `data_`, so `drain()` on a slice is O(1) and touches no memory. Appending advances `reservable_`. Capacity is rounded up to a multiple of 4 KB, the default slice is 16 KB, and a default read reservation is therefore 128 KB of writable space.
 
-[`OwnedImpl::drainImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.cc#L184) pops whole slices off the front and only advances an offset for the final partial one. [`OwnedImpl::move`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.cc#L334) walks the source deque and transfers slice ownership to the destination, so moving a megabyte between two buffers costs a handful of pointer moves rather than a megabyte of copying. The nuance lives in [`coalesceOrAddSlice`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.cc#L312): if the source slice holds fewer than 512 bytes, owns its storage rather than referencing a fragment, and the destination's tail slice has room, the bytes are copied instead — transferring ownership of a mostly-empty 16 KB slice to save a 100-byte memcpy is a bad trade. The partial-length overload of `move()` also copies when it must split a slice, since slices are not reference counted.
+[`OwnedImpl::drainImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.cc#L184) pops whole slices off the front and only advances an offset for the final partial one. [`OwnedImpl::move`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.cc#L334) walks the source deque and transfers slice ownership to the destination, so moving a megabyte between two buffers costs a handful of pointer moves rather than a megabyte of copying. The nuance lives in [`coalesceOrAddSlice`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.cc#L312): transferring ownership of a mostly-empty 16 KB slice to save a 100-byte memcpy is a bad trade. The partial-length overload of `move()` also copies when it must split a slice, since slices are not reference counted.
 
 [`linearize()`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.cc#L289) is the escape hatch for code needing a contiguous pointer: if the first slice already holds `size` bytes it hands back a pointer into it, otherwise it allocates a slice, copies the first `size` bytes in, drains them from the front and pushes the new slice on. That fallback is a copy by construction, which is why parsers avoid it.
 
@@ -43,7 +69,43 @@ The file descriptor is hidden behind [`IoHandle`](https://github.com/envoyproxy/
                                         uint64_t num_slice) PURE;
 ```
 
-[`IoSocketHandleImpl::read`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/io_socket_handle_impl.cc#L98) glues the two halves together: reserve, `readv`, commit exactly what came back. [`readv`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/io_socket_handle_impl.cc#L73) itself builds an `iovec` array from the slices and, when there is only one, calls `recv` instead to avoid the kernel's iovec handling. The write side mirrors it: [`IoSocketHandleImpl::write`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/io_socket_handle_impl.cc#L139) takes at most sixteen raw slices, hands them to `writev`, and drains what the kernel accepted. Socket options are applied through the same handle via `setOption`, with configuration-driven options expressed as [`Socket::Option`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/network/socket.h#L510) visitors that run at defined points in the socket's life.
+[`IoSocketHandleImpl::read`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/io_socket_handle_impl.cc#L98) glues the two halves together. [`readv`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/io_socket_handle_impl.cc#L73) itself builds an `iovec` array from the slices and, when there is only one, calls `recv` instead to avoid the kernel's iovec handling.
+
+```mermaid
+flowchart TD
+  DR["RawBufferSocket::doRead"]:::worker
+  RD["IoSocketHandleImpl::read"]:::worker
+  BUF[("Connection read buffer<br/>a WatermarkBuffer")]:::worker
+  RES["Reservation<br/>up to 8 RawSlice, 128 KB<br/>fresh storage owned by<br/>the reservation"]:::worker
+  RV["IoSocketHandleImpl::readv"]:::worker
+  K["Kernel receive queue"]:::ext
+  WB["WatermarkBuffer::commit"]:::worker
+  CM["OwnedImpl::commit"]:::worker
+  HW["checkHighAndOverflowWatermarks()"]:::worker
+
+  DR -- "read()" --> RD
+  RD -- "1 reserveForRead()" --> BUF
+  BUF -. "2 returns" .-> RES
+  RD -- "3 readv(slices(), numSlices())" --> RV
+  RV -- "4 readv() or recv()" --> K
+  K == "5 n bytes" ==> RES
+  RD -- "6 commit(n), 0 on error" --> RES
+  RES -- "7 Instance::commit()" --> WB
+  WB -- "8" --> CM
+  WB -- "9" --> HW
+  CM == "new Slice, or Slice::commit<br/>on the tail slice" ==> BUF
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef ext fill:#f5f5f5,stroke:#8a8a8a,color:#333333,stroke-dasharray:4 3;
+```
+*Figure 12.3 — One socket read: the kernel writes into storage the reservation
+owns, and only `commit(n)` hands it to the buffer. Source:
+[`IoSocketHandleImpl::read`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/io_socket_handle_impl.cc#L98),
+[`Reservation`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/buffer/buffer.h#L589),
+[`WatermarkBuffer::commit`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/watermark_buffer.cc#L48),
+[`OwnedImpl::commit`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/buffer/buffer_impl.cc#L472).*
+
+The write side mirrors it: [`IoSocketHandleImpl::write`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/io_socket_handle_impl.cc#L139) takes at most sixteen raw slices, hands them to `writev`, and drains what the kernel accepted. Socket options are applied through the same handle via `setOption`, with configuration-driven options expressed as [`Socket::Option`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/network/socket.h#L510) visitors that run at defined points in the socket's life.
 
 Every syscall is reached through [`Api::OsSysCalls`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/api/os_sys_calls.h#L45), a pure virtual interface whose POSIX implementation in [`os_sys_calls_impl.cc`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/api/posix/os_sys_calls_impl.cc) does nothing but call the libc function and package `errno`; call sites reach it through [`OsSysCallsSingleton`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/api/posix/os_sys_calls_impl.h#L77). The indirection buys a single place to paper over Windows and Linux differences, feature probing (`supportsMmsg`, `supportsUdpGro`), and the ability for tests to inject failures at any syscall without a real socket.
 
@@ -81,18 +143,29 @@ Watermarks bound a single buffer. To bound a whole stream, whose bytes may be sp
 
 Now follow a slow client downloading a large response. Every buffer between the upstream socket and the downstream socket is a place the bytes can pile up.
 
-```
-  bytes:   upstream socket -> router -> encoder filters -> codec stream
-                                                        -> connection write buffer -> client
+```mermaid
+flowchart TD
+  CL["Slow client"]:::ext
+  WB[("Connection write buffer")]:::worker
+  SB[("Codec stream send buffer")]:::worker
+  AS["ActiveStream::onAboveWriteBufferHighWatermark"]:::worker
+  FM["FilterManager::callHighWatermarkCallbacks"]:::worker
+  RD["UpstreamRequest::readDisableOrDefer"]:::upstream
+  UP["H1: socket read events off<br/>H2: WINDOW_UPDATE withheld"]:::upstream
 
-  signal:  write buffer / stream send buffer over high watermark
-              -> ActiveStream::onAboveWriteBufferHighWatermark
-              -> FilterManager::callHighWatermarkCallbacks
-              -> DownstreamWatermarkCallbacks (registered by the router)
-              -> UpstreamRequest::readDisableOrDefer
-              -> upstream stream readDisable
-              -> H1: socket read events off / H2: WINDOW_UPDATE withheld
+  CL -. "stops reading" .-> WB
+  WB & SB -- "above high watermark" --> AS
+  AS --> FM -. "DownstreamWatermarkManager" .-> RD --> UP
+  UP == "response bytes stop arriving" ==> WB
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef upstream fill:#fdf0e3,stroke:#b8762a,color:#553312;
+  classDef ext fill:#f5f5f5,stroke:#8a8a8a,color:#333333,stroke-dasharray:4 3;
 ```
+*Figure 12.4 — A slow client reaches back and stops the upstream. Source:
+[`ActiveStream::onAboveWriteBufferHighWatermark`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_manager_impl.cc#L2141),
+[`FilterManager::callHighWatermarkCallbacks`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L1724),
+[`UpstreamRequest::readDisableOrDefer`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_request.cc#L773).*
 
 The downstream write buffer fills first, because the kernel socket buffer is full and `onWriteReady` cannot drain it. Crossing the high watermark invokes [`onWriteBufferHighWatermark`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/connection_impl.cc#L703), which raises `onAboveWriteBufferHighWatermark` on the connection's [`ConnectionCallbacks`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/network/connection.h#L44); for an HTTP connection the connection manager (see [Chapter 6](./06-http-connection-manager.md)) forwards that to the codec, which fans it out to every active stream. The same signal also arrives per-stream from the codec's own buffers: in HTTP/2 each stream has a `pending_send_data_` watermark buffer whose [`pendingSendBufferHighWatermark`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/http2/codec_impl.cc#L741) calls [`runHighWatermarkCallbacks`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/codec_helper.h#L30).
 

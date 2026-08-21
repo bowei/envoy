@@ -53,13 +53,36 @@ candidates remain, and returns `Accept` or `Continue`. This is how a filter can 
 [`RouteMatcher`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.h#L1288), which performs a
 two-stage lookup.
 
+```mermaid
+flowchart TD
+  RC["ConfigImpl<br/>one RouteConfiguration"]:::config
+  RM["RouteMatcher<br/>domain to virtual host"]:::config
+  VH["VirtualHostImpl"]:::config
+  RE["RouteEntryImplBase, six subclasses<br/>one per path_specifier; one object is<br/>RouteEntryAndRoute, Matchable and<br/>DirectResponseEntry at once"]:::config
+  DR["the same object, seen as a DirectResponseEntry<br/>responseCode(), formatBody(), newUri()"]:::config
+  CE["clusterEntry()"]:::worker
+  SELF["shared_from_this():<br/>the route itself, cluster_name_"]:::worker
+  CSP["cluster_specifier_plugin_->route()<br/>Weighted, Header, or registered extension"]:::worker
+  WRAP["DynamicRouteEntry (WeightedClusterEntry)<br/>delegates, overrides clusterName()"]:::worker
+
+  RC -- "route_matcher_" --> RM
+  RM -- "virtual_hosts_" --> VH
+  VH -- "routes_" --> RE
+  RE -- "directResponseEntry() returns this" --> DR
+  RE -- "matches(), on success" --> CE
+  CE -- "no plugin" --> SELF
+  CE -- "plugin set" --> CSP
+  CSP -- "returns" --> WRAP
+
+  classDef config fill:#f3ebfa,stroke:#7a4fa3,color:#341a4d;
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
 ```
-:authority ──► RouteMatcher::findVirtualHost ──► VirtualHostImpl
-                                                     │
-:path, headers, query, cookies ──────────────────────┴──► RouteEntryImplBase::matches
-                                                              │
-                                                              └──► clusterEntry ──► Route
-```
+*Figure 7.1 — The route table, from one `RouteConfiguration` down to the per-request
+wrapper that names the cluster; purple is built at config time, green happens per
+request. Source: [`ConfigImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.h#L1410),
+[`VirtualHostImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.h#L458),
+[`RouteEntryAndRoute`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/router/router.h#L1366),
+[`RouteEntryImplBase::clusterEntry`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.cc#L1339).*
 
 [`RouteMatcher::findVirtualHost`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.cc#L1995)
 lower-cases the `Host` header (or an alternate header if `vhost_header` is configured,
@@ -73,12 +96,35 @@ ordering is total and deterministic.
 
 Once a virtual host is chosen,
 [`VirtualHostImpl::getRouteFromEntries`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.cc#L1856)
-runs. It reads `x-forwarded-proto` first: an absent scheme means the connection manager
-already gave up on the request, and matching returns `nullptr`. If the virtual host
-requires TLS and the scheme is not `https`, it short-circuits to the virtual host's
-pre-built [`SslRedirectRoute`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.h#L208), a
-direct-response route that emits a 301 to the `https` form of the URL. Only then does it
-walk the route list.
+runs two gates before it examines any route. An absent `x-forwarded-proto` means the
+connection manager already gave up on the request. A virtual host that requires TLS
+short-circuits to its pre-built
+[`SslRedirectRoute`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.h#L208), a
+direct-response route that emits a 301 to the `https` form of the URL.
+
+```mermaid
+flowchart TD
+  H(("request headers"))
+  FV["RouteMatcher::findVirtualHost<br/>exact → suffix → prefix → default *"]
+  GFE["VirtualHostImpl::getRouteFromEntries"]
+  SSL["ssl_redirect_route_<br/>SslRedirectRoute, 301 to https"]
+  NR(("no route"))
+  WALK(("walk the route list"))
+
+  H --> FV
+  FV -- "no matching virtual host" --> NR
+  FV --> GFE
+  GFE -- "no x-forwarded-proto" --> NR
+  GFE -- "TLS required, scheme not https" --> SSL
+  GFE --> WALK
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  class H,FV,GFE,SSL,NR,WALK worker;
+```
+*Figure 7.2 — Everything that can end a match before a single route entry is looked at.
+Source: [`RouteMatcher::route`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.cc#L2053),
+[`RouteMatcher::findVirtualHost`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.cc#L1995),
+[`VirtualHostImpl::getRouteFromEntries`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.cc#L1856).*
 
 ## Matching one route entry
 
@@ -97,14 +143,13 @@ its path test with the shared predicates and, on success, calls `clusterEntry()`
 
 Those shared predicates live in
 [`RouteEntryImplBase::matchRoute`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.cc#L864),
-evaluated in a fixed order, returning `false` at the first failure ("no need to waste
-further cycles calculating a route match"): the
-runtime fraction (a route can be enabled for a percentage of traffic, keyed on the
-caller-supplied random value), the gRPC flag, header matchers via
+evaluated in the fixed order of Figure 7.3 and returning `false` at the first failure ("no need to
+waste further cycles calculating a route match"). The runtime fraction is keyed on the
+caller-supplied random value, so a route can be enabled for a percentage of traffic; header
+matching goes through
 [`HeaderUtility::matchHeaders`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/header_utility.cc#L38),
-query parameter matchers, cookie matchers (both via
-[`ConfigUtility`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_utility.h#L27)), TLS peer
-certificate criteria, dynamic metadata matchers and filter state matchers. All must
+query parameters and cookies through
+[`ConfigUtility`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_utility.h#L27). All must
 pass.
 
 Several of those predicates want derived views of the request that are expensive to
@@ -122,6 +167,34 @@ a `RouteCallback` was supplied, each match is offered to it instead, and iterati
 continues on `Continue`. A route whose `supportsPathlessHeaders()` is false is skipped
 entirely when the request has no `:path`; only `ConnectRouteEntryImpl` overrides that to
 true, which is what lets `CONNECT` requests route at all.
+
+```mermaid
+flowchart TD
+  LOOP["getRouteFromRoutes<br/>next route, configuration order"]
+  M["matches() on that entry<br/>(ConnectRouteEntryImpl reverses<br/>the next two tests)"]
+  MR["RouteEntryImplBase::matchRoute<br/>runtime fraction → gRPC → headers<br/>→ query → cookies → TLS<br/>→ metadata → filter state"]
+  PM{"path matcher<br/>matches?"}
+  CE["clusterEntry()"]
+  CB{"RouteCallback?"}
+  NR(("no route"))
+  RES(("Route returned"))
+
+  LOOP --> M --> MR --> PM
+  MR -- "fails" --> LOOP
+  PM -- "no" --> LOOP
+  PM -- "yes" --> CE --> CB
+  CB -- "none, or Accept" --> RES
+  CB -- "Continue" --> LOOP
+  LOOP -- "exhausted" --> NR
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  class LOOP,M,MR,PM,CE,CB,NR,RES worker;
+```
+*Figure 7.3 — Walking the route list: each predicate in the order it is tested, and where
+the first match ends the walk unless a `RouteCallback` sends it back. Source:
+[`VirtualHostImpl::getRouteFromRoutes`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.cc#L1818),
+[`RouteEntryImplBase::matchRoute`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.cc#L864),
+[`ConnectRouteEntryImpl::matches`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/config_impl.cc#L1551).*
 
 ## The matcher tree alternative
 

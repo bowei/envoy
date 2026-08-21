@@ -103,6 +103,46 @@ carrying the local and remote addresses, and delivered to
 which applies the per-listener connection limit and hands off to
 `onAcceptWorker`.
 
+```mermaid
+flowchart TD
+  K["Kernel accept queue"]:::ext
+  EV["TcpListenerImpl::onSocketEvent"]:::worker
+  RJ["onReject():<br/>close, count"]:::worker
+  SK["AcceptedSocketImpl"]:::worker
+  OA["ActiveTcpListener::onAccept"]:::worker
+  OW["onAcceptWorker"]:::worker
+  OTH["another worker:<br/>onAcceptWorker,<br/>rebalanced"]:::worker
+  ATS["ActiveTcpSocket<br/>socket + StreamInfoImpl,<br/>no connection"]:::worker
+  CFC["continueFilterChain():<br/>listener filters"]:::worker
+  ANC["ActiveTcpSocket::<br/>newConnection"]:::worker
+  NC["ActiveStreamListenerBase::<br/>newConnection"]:::worker
+  FCM["FilterChainManagerImpl::<br/>findFilterChain"]:::worker
+  BLD["ServerConnectionImpl<br/>+ transport socket<br/>+ network filters"]:::worker
+
+  K -.->|"read event"| EV
+  EV -- "limit or load shed" --> RJ
+  EV -- "accept()" --> SK
+  SK -- "onAccept()" --> OA --> OW
+  OW -.->|"post()"| OTH
+  OW -- "onSocketAccepted()" --> ATS -- "startFilterChain()" --> CFC
+  CFC -- "filters done" --> ANC --> NC
+  NC -- "1" --> FCM
+  NC -- "2" --> BLD
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef ext fill:#f5f5f5,stroke:#8a8a8a,color:#333333,stroke-dasharray:4 3;
+```
+*Figure 4.1 — The TCP accept path, all of it on one worker thread unless the
+balancer posts elsewhere. The two `newConnection()`s are different methods:
+`ActiveTcpSocket`'s decides whether the socket goes to a different listener,
+`ActiveStreamListenerBase`'s calls `findFilterChain` (1) and then, on the chain
+it picked, `createDownstreamTransportSocket()`, `createServerConnection()` and
+`createNetworkFilterChain()` (2). Source:
+[`TcpListenerImpl::onSocketEvent`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/tcp_listener_impl.cc#L63),
+[`ActiveTcpListener::onAcceptWorker`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/active_tcp_listener.cc#L109),
+[`ActiveTcpSocket::newConnection`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/active_tcp_socket.cc#L196),
+[`ActiveStreamListenerBase::newConnection`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/active_stream_listener_base.cc#L27).*
+
 ## Balancing across workers
 
 With `SO_REUSEPORT` the kernel has already balanced: each worker accepts only
@@ -167,9 +207,45 @@ wraps the buffer in a `quic::QuicReceivedPacket` and hands it to
 which owns the connection-ID-to-session map. A packet for a known ID goes to its
 session; an Initial carrying a ClientHello makes QUICHE parse the CHLO and call
 [`CreateQuicSession`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/quic/envoy_quic_dispatcher.cc#L95),
-the QUIC analogue of everything between `accept()` and `newConnection`: it
-synthesises a connection socket, runs the QUIC listener filters, calls the same
-`findFilterChain` described below, and installs the chain's network filters.
+the QUIC analogue of everything between `accept()` and `newConnection`.
+
+```mermaid
+flowchart TD
+  K["Kernel UDP socket<br/>no accept(): one socket<br/>for every connection"]:::ext
+  HR["UdpListenerImpl::<br/>handleReadCallback"]:::worker
+  RP["readPacketsFromSocket()<br/>GRO / recvmmsg"]:::worker
+  PP["UdpListenerImpl::processPacket"]:::worker
+  OD["ActiveUdpListenerBase::onData"]:::worker
+  DEL["UdpListenerWorkerRouterImpl<br/>::deliver"]:::worker
+  OW["another worker:<br/>onDataWorker"]:::worker
+  ODW["ActiveQuicListener::<br/>onDataWorker"]:::worker
+  QD["EnvoyQuicDispatcher::<br/>processPacket"]:::worker
+  SESS["existing session<br/>for this ID"]:::worker
+  CQS["EnvoyQuicDispatcher::<br/>CreateQuicSession"]:::worker
+  STEPS["(1) startFilterChain()<br/>(2) findFilterChain(),<br/>as in Figure 4.1<br/>(3) EnvoyQuicServerSession<br/>+ network filters"]:::worker
+
+  K -.->|"read event"| HR
+  HR --> RP -- "per datagram" --> PP -- "onData()" --> OD
+  OD -- "destination() elsewhere" --> DEL
+  DEL -.->|"post()"| OW
+  OD -- "destination() is us" --> ODW -- "processPacket()" --> QD
+  QD -- "known ID" --> SESS
+  QD -- "Initial with CHLO" --> CQS --> STEPS
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef ext fill:#f5f5f5,stroke:#8a8a8a,color:#333333,stroke-dasharray:4 3;
+```
+*Figure 4.2 — The QUIC accept path. It diverges from Figure 4.1 at the socket —
+no accept queue, no per-connection file descriptor, steering by connection ID
+instead of by the kernel's choice of queue — and rejoins it at `findFilterChain`
+and the network filter chain. `processPacket` hands the packet to QUICHE's
+`ProcessPacket`, which routes it to the session for its connection ID or, once a
+ClientHello is complete, calls the `CreateQuicSession` override; steps 1–3 are
+all made by `CreateQuicSession` itself, in that order, and step 1 is
+`QuicListenerFilterManagerImpl::startFilterChain`. Source:
+[`UdpListenerImpl::handleReadCallback`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/udp_listener_impl.cc#L104),
+[`ActiveUdpListenerBase::onData`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/active_udp_listener.cc#L47),
+[`EnvoyQuicDispatcher::CreateQuicSession`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/quic/envoy_quic_dispatcher.cc#L95).*
 
 What it creates is an
 [`EnvoyQuicServerSession`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/quic/envoy_quic_server_session.h#L53),
@@ -214,13 +290,40 @@ that matter here:
 ```
 
 [`continueFilterChain`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/active_tcp_socket.cc#L124)
-walks the list calling `onAccept`. A filter that can decide immediately returns
-`Continue`. A filter that needs to see bytes returns `StopIteration` and declares,
-via `maxReadBytes()`, how many it wants. That triggers
+walks the list calling `onAccept`. A filter that needs to see bytes stops the
+iteration and says via `maxReadBytes()` how many it wants, which triggers
 [`createListenerFilterBuffer`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/active_tcp_socket.cc#L85),
 which registers a read event and, on each wakeup,
 [peeks](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/listener_filter_buffer_impl.cc#L55)
 at the socket with `MSG_PEEK`.
+
+```mermaid
+stateDiagram-v2
+  direction TB
+  [*] --> Iterating : startFilterChain()
+  Iterating --> Parked : StopIteration
+  Iterating --> Aborted : socket closed
+  Parked --> Parked : peek, onData() StopIteration
+  Parked --> Iterating : peek, onData() Continue
+  Parked --> Aborted : peek Error, RemoteClose
+  Parked --> TimedOut : onTimeout()
+  Iterating --> Committed : newConnection()
+  TimedOut --> Committed : set to continue
+  TimedOut --> [*] : otherwise
+  Aborted --> [*]
+  Committed --> [*]
+```
+*Figure 4.3 — The peek loop. Entering `Parked` builds the filter buffer and arms
+its read event with `activateFileEvent()`; a filter that answers from `onAccept`
+alone never leaves `Iterating`; the timeout branch is chosen by
+`continue_on_listener_filters_timeout`. `Aborted` unlinks and deferred-deletes
+the socket with no connection ever created; the peek-error edge reaches it
+through the filter buffer's close callback, which closes the socket and calls
+`continueFilterChain(false)`. Source:
+[`ActiveTcpSocket::continueFilterChain`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/active_tcp_socket.cc#L124),
+[`ActiveTcpSocket::createListenerFilterBuffer`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/active_tcp_socket.cc#L85),
+[`ActiveTcpSocket::onTimeout`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/active_tcp_socket.cc#L53),
+[`ListenerFilterBufferImpl::onFileEvent`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/listener_filter_buffer_impl.cc#L94).*
 
 `MSG_PEEK` is what makes the whole scheme work: the bytes stay in the kernel
 receive queue, so the eventual transport socket and network filters see an
@@ -283,13 +386,6 @@ now does Envoy build the real objects — a
 `createDownstreamTransportSocket()`, then a `ServerConnectionImpl` via
 [`createServerConnection`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/event/dispatcher_impl.cc#L153),
 then the network filters (see [Chapter 5](./05-network-filters-and-codecs.md)).
-
-```
-  accept()  →  ActiveTcpSocket  →  findFilterChain  →  ConnectionImpl
-              (socket only,        (uses what the      (buffers, filters,
-               listener filters     filters learned)    transport socket)
-               may peek/redirect)
-```
 
 The transport socket is the seam between "bytes on the wire" and "bytes the
 filters see":

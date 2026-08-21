@@ -52,35 +52,50 @@ a central map per scope guarded by a mutex, plus a per-thread cache of reference
 into it.
 
 [`safeMakeStat`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/stats/thread_local_store.cc#L536)
-is the whole design in one function: look in the thread-local cache and return on
-a hit with no lock at all; otherwise take the store lock, find or allocate the
-stat centrally, then insert a reference into the thread-local cache so the next
-lookup on this thread is lock-free. The thread-local entry is a bare reference,
+is the whole design in one function, drawn below. The thread-local entry is a
+bare reference,
 not a ref-count, because dropping a ref-count needs the allocator lock and would
 storm on scope destruction; so teardown is two-phase, with
 `releaseScopeCrossThread` keeping the central cache — which owns the
 `RefcountPtr`s — alive until every thread-local cache has been purged.
+
+```mermaid
+flowchart TD
+  CFS["Scope::counterFromString()"]:::worker
+  SYM[("SymbolTable<br/>token to 32-bit Symbol")]
+  SMS["counterFromTaggedName()<br/>getOrCreateCounterBase()<br/>safeMakeStat()"]:::worker
+  HIT{"in the TLS cache?"}:::worker
+  TLS[("TlsCacheEntry<br/>StatName to Counter reference")]:::worker
+  CEN[("CentralCacheEntry<br/>StatName to RefcountPtr")]
+  ALO[("Allocator<br/>owns the Counter, own mutex")]
+
+  CFS -- "encode(): toSymbol() per token" --> SYM
+  CFS -- "counterFromStatName()" --> SMS --> HIT
+  HIT -- "hit: no lock" --> TLS
+  HIT -- "miss: store lock" --> CEN
+  CEN -- "absent: makeCounter()" --> ALO
+  CEN -. "insert reference" .-> TLS
+
+  classDef plain fill:#ffffff,stroke:#7a7a7a,color:#222222;
+  class SYM,CEN,ALO plain;
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+```
+*Figure 13.1 — Incrementing one counter: encode once, then two caches and the
+allocator behind them; the uncoloured boxes are shared state, each behind its own
+lock. Source:
+[`ScopeImpl::safeMakeStat`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/stats/thread_local_store.cc#L536),
+[`ScopeImpl::getOrCreateCounterBase`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/stats/thread_local_store.cc#L627),
+[`SymbolTable::addTokensToEncoding`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/stats/symbol_table.cc#L266),
+[`Allocator::makeCounter`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/stats/allocator.cc#L297).*
 
 Histograms cannot work that way, since merging quantiles is not an atomic
 increment. Each thread gets a
 [`ThreadLocalHistogramImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/stats/thread_local_store.h#L36)
 holding *two* underlying histograms.
 
-```
-main thread                          worker threads
------------                          --------------
-flushStats() timer
-  mergeHistograms() ---- post ---->   beginMerge(): swap active/backup
-        ...                           (recording continues into new buffer)
-  <---- all-threads-done callback
-  mergeInternal(): ParentHistogram::merge()
-  flushMetricsToSinks()
-```
-
 [`mergeHistograms`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/stats/thread_local_store.cc#L272)
-posts `beginMerge` to every worker, which just flips which buffer is active; the
-completion callback merges the now-quiescent buffers on the main thread. No worker
-blocks.
+is arranged so that no worker ever blocks for a merge: all a worker is asked to
+run is a pointer swap.
 
 The flush loop itself is
 [`InstanceBase::flushStatsImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/server.cc#L238),
@@ -98,6 +113,37 @@ latches all counter deltas whether or not a sink is configured — hot restart (
 recording thread from
 [`deliverHistogramToSinks`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/stats/thread_local_store.cc#L655),
 so those implementations must be thread-safe.
+
+```mermaid
+flowchart TD
+  FLU["InstanceBase::flushStatsImpl()"]:::main
+  MRG["mergeHistograms()"]:::main
+  TLH[("ThreadLocalHistogramImpl<br/>recordValue() into the active buffer")]:::worker
+  PMR["mergeInternal()<br/>ParentHistogramImpl::merge()"]:::main
+  SNK["flushStatsInternal()<br/>MetricSnapshotImpl<br/>Sink::flush()"]:::main
+  ALO[("Allocator<br/>the central Counter objects")]
+
+  FLU --> MRG
+  MRG -.->|"post beginMerge(): swap buffers"| TLH
+  MRG -. "runOnAllThreads() complete" .-> PMR
+  TLH == "merge() drains the backup" ==> PMR
+  PMR -. "merge-complete callback" .-> SNK
+  SNK -- "forEachSinkedCounter(): latch()" --> ALO
+
+  classDef plain fill:#ffffff,stroke:#7a7a7a,color:#222222;
+  class ALO plain;
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef main fill:#e8f0fe,stroke:#3c6cb0,color:#12325c;
+```
+*Figure 13.2 — The flush: every step but the buffer swap runs on the main thread,
+and the snapshot latches the allocator's counters, not the per-worker caches.
+Source:
+[`ThreadLocalStoreImpl::mergeHistograms`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/stats/thread_local_store.cc#L272),
+[`ThreadLocalHistogramImpl::merge`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/stats/thread_local_store.cc#L1071),
+[`InstanceBase::flushStatsImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/server.cc#L238),
+[`MetricSnapshotImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/server.cc#L170),
+[`Allocator::forEachSinkedCounter`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/stats/allocator.cc#L399).*
 
 Two filters sit in front of creation. A
 [`StatsMatcher`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/stats/stats_matcher.h#L12) can reject a name,
@@ -196,14 +242,44 @@ percentages if it has any — and calls `setSampled`, but only if the span repor
 `useLocalDecision`, since a tracer driving its own sampler or an external trace
 context ignores Envoy's decision anyway. The router's
 [`UpstreamRequest`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_request.cc#L99)
-constructor spawns a child span when one is configured and injects that span's
-context into the outbound headers, falling back to the parent span's context when
-there is no child. At stream destruction
+constructor spawns a child span when one is configured, falling back to injecting
+the parent span's context when there is no child. At stream destruction
 [`finalizeDownstreamSpan`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/tracing/http_tracer_impl.cc#L148)
 tags the span with the request URL, method, peer address and byte counts, adds
 the shared tags — upstream cluster, status code, response flags — in
 [`setCommonTags`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/tracing/http_tracer_impl.cc#L239),
 and calls `finishSpan`.
+
+```mermaid
+flowchart TD
+  CLI["Downstream request<br/>b3 / traceparent"]:::ext
+  TR["ActiveStream::traceRequest()<br/>shouldTraceRequest()<br/>TracerImpl::startSpan()<br/>Driver::startSpan()"]:::worker
+  DS["Downstream span"]:::worker
+  A1["child span<br/>attempt 1"]:::upstream
+  A2["child span<br/>attempt 2: retry.count"]:::upstream
+  UPH["Upstream request headers<br/>x-b3-traceid, x-b3-spanid,<br/>x-b3-parentspanid, x-b3-sampled"]:::upstream
+  FIN["finalizeUpstreamSpan()<br/>finalizeDownstreamSpan()"]:::worker
+  REP["Tracer::reportSpan()<br/>ReporterImpl::reportSpan()"]:::worker
+  COL["Collector"]:::ext
+
+  CLI -- "mutateTracingRequestHeader()" --> TR --> DS
+  DS -- "spawnChild()" --> A1 & A2
+  A1 & A2 -- "injectContext()" --> UPH
+  A1 & A2 -. "cleanUp()" .-> FIN
+  DS -. "completeRequest()" .-> FIN
+  FIN -- "finishSpan()" --> REP -- "flushSpans(): POST" --> COL
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef upstream fill:#fdf0e3,stroke:#b8762a,color:#553312;
+  classDef ext fill:#f5f5f5,stroke:#8a8a8a,color:#333333,stroke-dasharray:4 3;
+```
+*Figure 13.3 — One request, two attempts, three spans; header names and the
+reporter are the Zipkin driver's. Source:
+[`ActiveStream::traceRequest`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_manager_impl.cc#L1608),
+[`UpstreamRequest::UpstreamRequest`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_request.cc#L99),
+[`Span::injectContext`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/extensions/tracers/zipkin/zipkin_core_types.cc#L217),
+[`HttpTracerUtility::finalizeDownstreamSpan`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/tracing/http_tracer_impl.cc#L148),
+[`ReporterImpl::flushSpans`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/extensions/tracers/zipkin/zipkin_tracer_impl.cc#L198).*
 
 ## Trace context and propagation
 

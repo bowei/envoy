@@ -110,8 +110,7 @@ main thread; workers never touch those objects. Instead each worker holds a
 `ThreadLocalClusterManagerImpl` containing a
 [`ClusterEntry`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/upstream/cluster_manager_impl.h#L600) per cluster,
 and `ClusterEntry` is what implements
-[`ThreadLocalCluster`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/upstream/thread_local_cluster.h#L79). Each entry has
-its own `PrioritySetImpl`, its own load balancer instance, and its own connection pools. What is
+[`ThreadLocalCluster`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/upstream/thread_local_cluster.h#L79). What is
 shared is shared by `shared_ptr` and treated as immutable: `ClusterInfo`, host objects, and the
 `HostVector`s themselves — the one mutable exception being each `Host`'s atomic health-flag
 bitmask, discussed below.
@@ -124,6 +123,41 @@ its own priority set — the read-copy-update idiom of
 worker has never used are deferred — the
 update is stored as a "cluster initialization object" and inflated lazily by
 `initializeClusterInlineIfExists`.
+
+```mermaid
+flowchart TD
+  subgraph MT["Main thread"]
+    CL["Cluster::prioritySet()<br/>authoritative HostSets"]:::main
+    PT["ClusterManagerImpl<br/>active_clusters_<br/>postThreadLocalClusterUpdate()"]:::main
+  end
+  SNAP[("updateHostsParams():<br/>const HostVector per priority")]:::main
+  subgraph WT["Worker thread"]
+    TL["ThreadLocalClusterManagerImpl"]:::worker
+    DC[("thread_local_deferred_clusters_")]:::worker
+    CE["ClusterEntry<br/>implements ThreadLocalCluster"]:::worker
+    PS["PrioritySetImpl, LoadBalancer,<br/>connection pools"]:::worker
+  end
+  RF["Router::Filter"]:::worker
+
+  CL -- "addPriorityUpdateCb()" --> PT --> SNAP
+  SNAP -.->|"tls_.runOnAllThreads()"| TL
+  TL -- "updateClusterMembership()" --> CE
+  CE -- "updateHosts()" --> PS
+  TL -- "not inflated here" --> DC
+  DC -- "initializeClusterInlineIfExists()" --> CE
+  RF -- "getThreadLocalCluster()" --> TL
+
+  style MT fill:none,stroke:#b9b9b9,color:#444444;
+  style WT fill:none,stroke:#b9b9b9,color:#444444;
+
+  classDef main fill:#e8f0fe,stroke:#3c6cb0,color:#12325c;
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+```
+*Figure 8.1 — One cluster on the main thread, one `ClusterEntry` per worker, and the
+one-way path between them. Source:
+[`ClusterManagerImpl::postThreadLocalClusterUpdate`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/upstream/cluster_manager_impl.cc#L1177),
+[`ThreadLocalClusterManagerImpl::updateClusterMembership`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/upstream/cluster_manager_impl.cc#L1842),
+[`initializeClusterInlineIfExists`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/upstream/cluster_manager_impl.cc#L1354).*
 
 ## Hosts, priorities and localities
 
@@ -214,8 +248,41 @@ partially broken backend beats no backend. Second, locality selection: if a loca
 configured, `regenerateLocalityRoutingStructures` compares — on membership change, not per request
 — the fraction of local-cluster hosts in this zone against the fraction of upstream hosts in the
 same zone, and latches either `LocalityDirect` or `LocalityResidual`; `tryChooseLocalLocalityHosts`
-then either routes entirely locally or samples one of the residual localities. Both steps yield a
-`HostsSource` — a (priority, slice, locality) cursor.
+then either routes entirely locally or samples one of the residual localities.
+
+```mermaid
+flowchart TD
+  RF["Router::Filter<br/>as LoadBalancerContext"]:::worker
+  CE["ClusterEntry::chooseHost()"]:::worker
+  OH["HostUtility<br/>selectOverrideHost()"]:::worker
+  LB["ZoneAwareLoadBalancerBase<br/>chooseHost() retry loop"]:::worker
+  ONCE["EdfLoadBalancerBase<br/>chooseHostOnce()"]:::worker
+  HSU["hostSourceToUse()<br/>chooseHostSet(): priority,<br/>panic -> AllHosts<br/>then tryChooseLocalLocalityHosts()<br/>= one HostsSource"]:::worker
+  EDF["EdfScheduler<br/>pickAndAdd()"]:::worker
+  SRC["hostSourceToHosts()<br/>all / healthy /<br/>degraded / locality"]:::worker
+  UW["unweightedHostPick()"]:::worker
+  H["Host"]:::upstream
+
+  RF --> CE
+  CE -- "first" --> OH
+  CE -- "no override host" --> LB
+  LB -- "chooseHostOnce()" --> ONCE --> HSU
+  HSU -- "weights differ" --> EDF
+  HSU -- "weights equal" --> SRC --> UW
+  EDF & UW --> H
+  H -. "shouldSelectAnotherHost()" .-> LB
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef upstream fill:#fdf0e3,stroke:#b8762a,color:#553312;
+```
+*Figure 8.2 — From cluster to host: everything that narrows the candidate list before
+`chooseHostOnce` sees it. Both selection steps yield a `HostsSource` — a (priority, slice,
+locality) cursor — which the weighted path uses as a scheduler key and the unweighted path
+resolves to a `HostVector`. Source:
+[`ClusterEntry::chooseHost`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/upstream/cluster_manager_impl.cc#L2131),
+[`ZoneAwareLoadBalancerBase::chooseHost`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/extensions/load_balancing_policies/common/load_balancer_impl.cc#L658),
+[`hostSourceToUse`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/extensions/load_balancing_policies/common/load_balancer_impl.cc#L838),
+[`EdfLoadBalancerBase::chooseHostOnce`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/extensions/load_balancing_policies/common/load_balancer_impl.cc#L1145).*
 
 Weighted policies then go through
 [`EdfLoadBalancerBase`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/extensions/load_balancing_policies/common/load_balancer_impl.h#L514),
@@ -284,20 +351,35 @@ upstream protocol, socket options and transport socket options, computed in
 so that streams with incompatible connection requirements can never share a connection.
 
 All pools share [`ConnPoolImplBase`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/conn_pool/conn_pool_base.h#L183),
-which sorts its clients into per-state lists driven by a small state machine:
+which sorts its clients into per-state lists driven by a small state machine. `owningList` maps
+each state to the list that owns the client, which is why `Busy` and `Draining` share
+`busy_clients_` and a transition between them moves nothing.
 
-```cpp
-  enum class State {
-    Connecting,        // Connection is not yet established.
-    ReadyForEarlyData, // Any additional early data stream can be immediately dispatched to this
-                       // connection.
-    Ready,             // Additional streams may be immediately dispatched to this connection.
-    Busy,              // Connection is at its concurrent stream limit.
-    Draining,          // No more streams can be dispatched to this connection, and it will be
-                       // closed when all streams complete.
-    Closed             // Connection is closed and object is queued for destruction.
-  };
+```mermaid
+stateDiagram-v2
+  [*] --> Connecting : instantiateActiveClient()
+  Connecting --> ReadyForEarlyData : ConnectedZeroRtt
+  Connecting --> Ready : Connected
+  Connecting --> Busy : Connected, no capacity
+  ReadyForEarlyData --> Ready : Connected
+  Ready --> Busy : attachStreamToClient()
+  Busy --> Ready : onStreamClosed()
+  Ready --> Draining : max streams
+  Busy --> Draining : onGoAway()
+  Draining --> Closed : last stream
+  Connecting --> Closed : timeout or failure
+  Ready --> Closed : close event
+  Busy --> Closed : close event
+  Closed --> [*] : deferredDelete()
 ```
+*Figure 8.3 — The connection pool client state machine. A close event in any state lands the
+client in `Closed`, including `onConnectTimeout` on a connecting one; `drainConnections()` moves
+`Ready` and `Busy` clients to `Draining` by the same two edges as `max streams` and `onGoAway()`.
+Source:
+[`ActiveClient::State`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/conn_pool/conn_pool_base.h#L91),
+[`ConnPoolImplBase::onConnectionEvent`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/conn_pool/conn_pool_base.cc#L563),
+[`transitionActiveClientState`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/conn_pool/conn_pool_base.cc#L439),
+[`ConnPoolImplBase::onStreamClosed`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/conn_pool/conn_pool_base.cc#L283).*
 
 [`newStreamImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/conn_pool/conn_pool_base.cc#L327)
 attaches to a ready client if one exists, otherwise queues a pending stream and calls
@@ -364,10 +446,41 @@ The connection is then wrapped in a
 [`createCodecClient`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_pool_base.h#L98) hook;
 [`CodecClientProd`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/codec_client.h#L359) constructs the HTTP/1,
 HTTP/2 or HTTP/3 client codec, unless the cluster configures a codec factory of its own.
-`CodecClient` owns the connection, holds the list of active requests, and is what a pool client's
-`newStream` eventually reaches; its
+`CodecClient` owns the connection and holds the list of active requests; its
 [`onEvent`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/codec_client.cc#L105) resets every outstanding request when
 the connection dies.
+
+```mermaid
+flowchart TD
+  AH["UpstreamRequest<br/>acceptHeadersFromRouter()"]:::upstream
+  NS["ConnPoolImplBase::newStreamImpl()<br/>queues a PendingStream,<br/>tryCreateNewConnection()"]:::upstream
+  AC["ActiveClient ctor:<br/>Host::createConnection(),<br/>createCodecClient()"]:::upstream
+  FM["UpstreamFilterManager<br/>decodeHeaders()"]:::upstream
+  UCF["UpstreamCodecFilter<br/>upstream() still null:<br/>latch headers, StopAllIterationAndWatermark"]:::upstream
+  PR["ConnPoolImplBase::onConnectionEvent()<br/>state Ready, onUpstreamReady(),<br/>attachStreamToClient()"]:::upstream
+  HP["HttpConnPoolImplBase::onPoolReady()<br/>newStreamEncoder() -> RequestEncoder<br/>then HttpConnPool::onPoolReady()"]:::upstream
+  OE["UpstreamRequest::onPoolReady()"]:::upstream
+  EH["HttpUpstream::encodeHeaders()<br/>-> RequestEncoder"]:::upstream
+  HOST["Upstream host"]:::ext
+
+  AH -- "step 1 newStream()" --> NS --> AC
+  AH -- "step 2 decodeHeaders()" --> FM --> UCF
+  AC -. "Connected" .-> PR
+  PR -- "step 3 onPoolReady()" --> HP --> OE
+  OE -. "step 4 onUpstreamConnectionEstablished()" .-> UCF
+  UCF -- "decodeHeaders() replays<br/>the latched headers" --> EH
+  EH == "request headers" ==> HOST
+
+  classDef upstream fill:#fdf0e3,stroke:#b8762a,color:#553312;
+  classDef ext fill:#f5f5f5,stroke:#8a8a8a,color:#333333,stroke-dasharray:4 3;
+```
+*Figure 8.4 — One request's upstream connection: the pool is asked for a stream before the
+upstream filter chain runs, and the headers do not leave until `onPoolReady` unblocks the codec
+filter. Source:
+[`UpstreamRequest::acceptHeadersFromRouter`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_request.cc#L412),
+[`HttpConnPoolImplBase::onPoolReady`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_pool_base.cc#L84),
+[`UpstreamRequest::onPoolReady`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_request.cc#L634),
+[`UpstreamCodecFilter::onUpstreamConnectionEstablished`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_codec_filter.cc#L42).*
 
 Connect failure and connect timeout are separate paths that must stay separate, because the reset
 reason differs — even though the router folds all three back onto the one

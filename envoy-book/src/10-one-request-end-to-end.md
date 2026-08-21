@@ -9,6 +9,103 @@ Two things are worth fixing in your head before we start. First, every hop below
 
 Second, the stack does not run from socket to socket in one go. It unwinds back to the event loop at several points, and resumes later from a fresh libevent callback. Those points are marked **[loop]** below; they are the part readers most often get wrong.
 
+The whole walk does not fit legibly in one diagram, so it is drawn twice, cut along the seam where the downstream filter manager hands the request to the router and the router hands the response back. Figure 10.1 is the downstream side of the proxy; Figure 10.2 is the upstream side, and it sits between the two halves of Figure 10.1.
+
+```mermaid
+---
+config:
+  sequence:
+    actorMargin: 4
+    width: 96
+    boxMargin: 6
+    noteMargin: 6
+---
+sequenceDiagram
+  participant K as Kernel
+  participant L as TcpListenerImpl<br/>ActiveTcpListener<br/>ActiveTcpSocket
+  participant C as ConnectionImpl<br/>h2 codec
+  participant M as ConnectionManagerImpl<br/>ActiveStream, filters
+  Note over K,M: one worker thread, one dispatcher, accept to log
+  K-->>L: listen fd readable
+  L->>L: onSocketEvent(), accept(2)
+  L->>L: onAccept(), onAcceptWorker()
+  L->>L: onSocketAccepted()
+  L->>L: continueFilterChain()
+  Note over K,M: listener filters can stop and resume: back to the loop
+  L->>L: newConnection(), findFilterChain()
+  Note over K,M: createServerConnection() over a new SslSocket
+  L->>C: creates
+  K-->>C: fd readable
+  C->>C: onFileEvent(), onReadReady()
+  C->>C: SslSocket::doRead()
+  Note over K,M: handshake round trips, one loop callback each
+  C->>M: onRead(), onData()
+  Note over K,M: createCodec() builds the h2 codec on the first buffer
+  M->>C: dispatch()
+  C->>M: newStream()
+  C->>M: decodeHeaders()
+  Note over K,M: decoder filters run here, ending at Router::Filter
+  Note over K,M: the upstream half of the walk is Figure 10.2
+  M->>M: encodeHeaders()
+  M->>C: encodeHeadersBase()
+  C->>C: onSend(), write()
+  Note over K,M: write() only buffers, no syscall yet
+  M->>M: doEndStream()
+  Note over K,M: log(), deferredDelete(), then back to the loop
+  C->>C: onWriteReady()
+  C->>K: writev()
+```
+*Figure 10.1 — The downstream side of one request, hops 1-13 and 26-30. Source:
+[`ActiveTcpSocket::continueFilterChain`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/active_tcp_socket.cc#L124),
+[`ConnectionManagerImpl::onData`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_manager_impl.cc#L515),
+[`ConnectionManagerImpl::doDeferredStreamDestroy`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_manager_impl.cc#L331).*
+
+```mermaid
+---
+config:
+  sequence:
+    actorMargin: 4
+    width: 96
+    boxMargin: 6
+    noteMargin: 6
+---
+sequenceDiagram
+  participant M as ActiveStream<br/>FilterManager
+  participant R as Router::Filter<br/>UpstreamRequest<br/>UpstreamCodecFilter
+  participant P as HttpConnPoolImplBase<br/>CodecClient, h1 codec<br/>ConnectionImpl
+  participant K as Kernel
+  Note over M,K: still the worker thread of Figure 10.1
+  M->>R: decodeHeaders()
+  Note over M,K: route, cluster, host and pool are picked here
+  R->>R: continueDecodeHeaders()
+  R->>R: acceptHeadersFromRouter()
+  R->>P: newStream()
+  P->>P: newPendingStream()
+  P->>K: connect() a new socket
+  Note over M,K: cold pool: the stream is queued, back to the loop
+  K-->>P: writable
+  P->>P: onConnectionEvent()
+  P->>P: onUpstreamReady(), attachStreamToClient()
+  P->>R: onPoolReady()
+  R->>R: onUpstreamConnectionEstablished()
+  R->>P: encodeHeaders()
+  P->>P: flushOutput(), write()
+  Note over M,K: write() only buffers, back to the loop
+  P->>K: writev() in onWriteReady()
+  Note over M,K: back to the loop until the response arrives
+  K-->>P: readable
+  P->>P: CodecClient::onData(), dispatch()
+  P->>R: decodeHeaders()
+  R->>R: UpstreamRequest::decodeHeaders()
+  R->>R: onUpstreamHeaders()
+  R->>M: encodeHeaders()
+  Note over M,K: the response continues in Figure 10.1
+```
+*Figure 10.2 — The upstream side of the same request, hops 14-25. Source:
+[`UpstreamRequest::acceptHeadersFromRouter`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_request.cc#L412),
+[`ConnPoolImplBase::onConnectionEvent`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/conn_pool/conn_pool_base.cc#L563),
+[`UpstreamCodecFilter::CodecBridge::decodeHeaders`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_codec_filter.cc#L149).*
+
 One scope note. Every hop below traces HTTP over TCP: an `accept(2)` loop, a TLS transport socket, and a network filter chain terminating in the connection manager. A QUIC connection reaches roughly the same place by a different route (see [Chapter 4](./04-accept-path.md)) — datagrams reach a worker at [`ActiveQuicListener::onDataWorker`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/quic/active_quic_listener.cc#L172), which hands them to QUICHE's `QuicDispatcher` to be demultiplexed by connection id (the same id having already picked the worker — in the kernel where the [BPF socket option](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/quic/envoy_quic_connection_id_generator_factory.h#L40) is available, and otherwise in [`ActiveQuicListener::destination`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/quic/active_quic_listener.cc#L255), which redirects the packet to the right worker), and [`EnvoyQuicDispatcher::CreateQuicSession`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/quic/envoy_quic_dispatcher.cc#L95) runs the listener filters, does the filter chain match and calls `createNetworkFilterChain` itself. There is no transport socket on that path at all: the QUIC stack handles all L4 data, so the [QUIC transport socket factory](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/quic/quic_transport_socket_factory.h#L40) supplies a TLS context instead of a socket, and the handshake and stream framing live in the session. The connection manager does still build a codec, but for QUIC it does so in [`onNewConnection`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_manager_impl.cc#L584) rather than lazily on the first buffer, and that codec is a thin shim: QUIC connections bypass `onData` entirely, so its `dispatch()` panics if reached. From [`setUpRequestDecoder`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/quic/envoy_quic_server_session.cc#L153), which `CreateIncomingStream` runs for a new request stream and which calls the same `newStream` as hop 10, the two paths converge.
 
 ## Accepting the connection
@@ -63,7 +160,7 @@ One scope note. Every hop below traces HTTP over TCP: an `accept(2)` loop, a TLS
 
 ## The response
 
-22. **[loop]** The upstream socket becomes readable. `onFileEvent` → `onReadReady` → raw-buffer `doRead` → `onRead` → the upstream connection's read filter chain, whose `CodecClient::CodecReadFilter` forwards to [`CodecClient::onData`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/codec_client.cc#L187).
+22. **[loop]** The upstream socket becomes readable. The read path of hops 5 and 7 repeats on the upstream connection — with a raw buffer socket rather than a TLS one — and its read filter chain's `CodecClient::CodecReadFilter` forwards to [`CodecClient::onData`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/codec_client.cc#L187).
 
 23. [`Http1::ClientConnectionImpl::dispatch`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/http1/codec_impl.cc#L632) parses the status line; [`ClientConnectionImpl::onHeadersCompleteBase`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/http1/codec_impl.cc#L1521) calls `decodeHeaders` on the pending response decoder.
 

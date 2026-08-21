@@ -88,18 +88,45 @@ Envoy configuration never names a C++ class. A filter entry carries a `name` and
 selects the implementation. The resolution logic lives in
 [`Config::Utility`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/config/utility.h#L68):
 
+```mermaid
+flowchart TD
+  A["http_filters[i]<br/>name + typed_config (Any)"]:::config
+  B["FilterChainHelper::processFilter"]:::main
+  C["Config::Utility::getAndCheckFactory<br/>getFactoryType() names the type,<br/>getFactoryByType() looks it up"]:::main
+  D["FactoryRegistry::getFactoryByType<br/>lookup in factoriesByType()"]:::main
+  E["BufferFilterFactory<br/>a NamedHttpFilterConfigFactory"]:::main
+  F["Config::Utility::translateToFactoryConfig<br/>then translateOpaqueConfig()"]:::main
+  G["typed config message"]:::config
+  H["createFilterFactoryFromProto"]:::main
+  I["Http::FilterFactoryCb<br/>captures one BufferFilterConfig"]:::config
+  P["FilterFactoriesList<br/>one FilterConfigProvider per filter"]:::main
+  X["HttpConnectionManagerConfig::createFilterChain<br/>once per stream, from FilterManager::createFilterChain"]:::worker
+  J["FilterChainUtility::createFilterChainForFactories"]:::worker
+  K["addStreamDecoderFilter<br/>one BufferFilter for this stream"]:::worker
+
+  A --> B
+  B -- "type URL" --> C
+  C -- "descriptor full name" --> D
+  D -- "the registered factory" --> E
+  E -- "createEmptyConfigProto()" --> F
+  F --> G
+  E & G --> H
+  H --> I
+  I -- "createStaticFilterConfigProvider()" --> P
+  P --> X
+  X --> J
+  J -. "provider->config().value()(callbacks)" .-> K
+
+  classDef main fill:#e8f0fe,stroke:#3c6cb0,color:#12325c;
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef config fill:#f3ebfa,stroke:#7a4fa3,color:#341a4d;
 ```
-typed_config (Any)
-   │  type_url: "type.googleapis.com/envoy...v3.Buffer"
-   ▼
-getFactoryType()  ──► strips the URL prefix; if the payload is an
-   │                  xds.type.v3.TypedStruct, uses its inner type_url
-   ▼
-FactoryRegistry<Base>::getFactoryByType("envoy...v3.Buffer")
-   │
-   ▼
-factory ──► createEmptyConfigProto() ──► translateOpaqueConfig() ──► typed config message
-```
+*Figure 3.1 — From a type URL to a running filter; blue runs once on the main
+thread at configuration time, green once per stream on a worker. Source:
+[`FilterChainHelper::processFilter`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_chain_helper.h#L96),
+[`Utility::getFactoryType`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/config/utility.h#L290),
+[`FilterChainUtility::createFilterChainForFactories`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_chain_helper.cc#L18),
+[`HttpConnectionManagerConfig::createFilterChain`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/extensions/filters/network/http_connection_manager/config.cc#L861).*
 
 [`getFactoryType`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/config/utility.h#L290) reduces the URL to a
 descriptor name, transparently unwrapping (one level; nested structs are not handled) the
@@ -218,9 +245,43 @@ of them, and [`AllFieldMatcher`](https://github.com/envoyproxy/envoy/blob/981d39
 its `Any`/`Not` siblings compose those into boolean predicates. On a match the leaf yields an
 [`Action`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/matcher/matcher.h#L104) — a typed object built at config time that the
 caller downcasts with `getTyped<T>()`, which is how a route or a filter chain gets attached to a
-match. Each piece has its own factory category: `envoy.matching.action`,
-`envoy.matching.input_matchers`, `envoy.matching.common_inputs`, and a per-data-type
-`envoy.matching.<type>.input`.
+match.
+
+```mermaid
+flowchart TD
+  FAC["MatchTreeFactory::create<br/>resolves every input, matcher and action<br/>through Config::Utility"]:::config
+  T["ListMatcher::match<br/>predicates in order, first hit wins"]
+  S["SingleFieldMatcher::match<br/>InsufficientData if the input is not there yet,<br/>or if it did not match and more may arrive"]
+  D["DataInput::get<br/>envoy.matching.[type].input<br/>or envoy.matching.common_inputs"]
+  G["DataInputGetResult<br/>value + DataAvailability"]
+  IM["InputMatcher::match<br/>envoy.matching.input_matchers"]
+  R{"MatchResult"}
+  HR["MatchTree::handleRecursionAndSkips"]
+  AMR["ActionMatchResult"]
+  ACT["Action<br/>envoy.matching.action"]
+
+  FAC -. "MatchTreeFactoryCb" .-> T
+  T -- "match(data)" --> S
+  S -- "get(data)" --> D
+  D --> G --> IM --> R
+  R -- "NoMatch: next predicate" --> T
+  R -- "Matched: the OnMatch" --> HR
+  R -- "InsufficientData" --> AMR
+  T -- "list exhausted:<br/>on_no_match_" --> HR
+  HR -- "matcher_:<br/>recurse" --> T
+  HR -- "keep_matching_:<br/>next" --> T
+  HR -- "action_, or no match" --> AMR
+  AMR -- "action(), getTyped" --> ACT
+
+  classDef plain fill:#ffffff,stroke:#7a7a7a,color:#222222;
+  class T,S,D,G,IM,R,HR,AMR,ACT plain;
+  classDef config fill:#f3ebfa,stroke:#7a4fa3,color:#341a4d;
+```
+*Figure 3.2 — One evaluation of a list-shaped match tree; a map node replaces the
+predicate step with a hash or radix lookup on the same input. Source:
+[`handleRecursionAndSkips`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/matcher/matcher.h#L221),
+[`SingleFieldMatcher::match`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/matcher/field_matcher.h#L124),
+[`ListMatcher::match`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/matcher/list_matcher.h#L14).*
 
 Two node shapes cover the configuration surface (an unset `matcher_type` produces a third,
 `AnyMatcher`, which just runs its `on_no_match`):

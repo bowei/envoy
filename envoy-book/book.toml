@@ -2,3 +2,13 @@
 title = "Envoy"
 authors = ["Bowei Du"]
 language = "en"
+
+[output.html]
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.pdf]
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

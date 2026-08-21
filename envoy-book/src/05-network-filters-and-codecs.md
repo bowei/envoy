@@ -25,9 +25,47 @@ end_stream)`. The mirror image, [`WriteFilter`](https://github.com/envoyproxy/en
 `onWrite`. Both return a `FilterStatus` that is either `Continue` or `StopIteration` — there is no
 third value at L4. Crucially, `data` is not a copy handed to the filter; it is the connection's own
 read buffer, and filters consume bytes by draining it. Per
-[`FilterManager`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/network/filter.h#L308), read filters run in FIFO order and
-write filters in LIFO order, so a filter that wraps the wire format occupies the same position on
-both paths.
+[`FilterManager`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/network/filter.h#L308), the two orders are mirror
+images, so a filter that wraps the wire format occupies the same position on both paths.
+
+```mermaid
+flowchart TD
+  CL["Downstream client"]:::ext
+  RB[("read_buffer_")]:::worker
+  FMR["FilterManagerImpl::onContinueReading<br/>upstream_filters_, FIFO"]:::worker
+  A["Filter A"]:::worker
+  B["Filter B"]:::worker
+  T["Terminal read filter:<br/>TcpProxy::Filter, or<br/>ConnectionManagerImpl and its codec"]:::worker
+  CW["ConnectionImpl::write<br/>then FilterManagerImpl::onWrite<br/>downstream_filters_, LIFO"]:::worker
+  WB[("write_buffer_")]:::worker
+
+  CL == "doRead()" ==> RB
+  RB -- "onRead()" --> FMR
+  FMR == "onData()" ==> A
+  A == "onData()" ==> B
+  B == "onData()" ==> T
+  T -- "connection().write()" --> CW
+  CW == "onWrite()" ==> B
+  B == "onWrite()" ==> A
+  CW == "all Continue: move()" ==> WB
+  WB == "doWrite()" ==> CL
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef ext fill:#f5f5f5,stroke:#8a8a8a,color:#333333,stroke-dasharray:4 3;
+```
+*Figure 5.1 — One connection, two chains. Neither filter calls the next: both loops live in the
+filter manager, which re-fetches the buffer between filters and runs read filters in registration
+order and write filters in reverse — `addReadFilter` appends to `upstream_filters_` while
+`addWriteFilter` prepends to `downstream_filters_`, and both loops walk from `begin()`. So
+combination `Filter`s — A and B here, registered with `addFilter` — sit at mirrored positions. The
+write filters see the caller's buffer; only once the last returns `Continue` does the connection
+move it into `write_buffer_`. Source:
+[`FilterManagerImpl::onContinueReading`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/filter_manager_impl.cc#L62),
+[`addReadFilter`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/filter_manager_impl.cc#L25),
+[`addWriteFilter`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/filter_manager_impl.cc#L13),
+[`FilterManagerImpl::onWrite`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/filter_manager_impl.cc#L180),
+[`ConnectionImpl::write`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/connection_impl.cc#L590),
+[`TcpProxy::Filter::onUpstreamData`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/tcp_proxy/tcp_proxy.cc#L1275).*
 
 The loop lives in
 [`FilterManagerImpl::onContinueReading`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/filter_manager_impl.cc#L62),
@@ -52,12 +90,35 @@ filter first reached long after the connection opened still sees it before any `
 ## Stopping and resuming
 
 `StopIteration` is how an L4 filter buys time — to consult an authorization service, to wait for
-enough bytes to sniff a protocol, to establish an upstream connection. Resumption is explicit.
-[`ReadFilterCallbacks::continueReading`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/network/filter.h#L176) re-enters
-`onContinueReading` at the *next* filter, passing the connection itself as the buffer source, so
-the resumed filter sees whatever accumulated meanwhile. To control exactly what its successors see,
-a filter instead calls `injectReadDataToFilterChain`, which wraps the caller's own buffer in a
-`FixedReadBufferSource` and runs the rest of the chain against that.
+enough bytes to sniff a protocol, to establish an upstream connection. Resumption is explicit:
+nothing re-enters the chain until the stopped filter says so.
+[`ReadFilterCallbacks::continueReading`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/network/filter.h#L176) passes the
+connection itself as the buffer source, so the resumed filter sees whatever accumulated meanwhile;
+a filter that wants to control exactly what its successors see calls `injectReadDataToFilterChain`
+instead, which wraps the caller's own buffer in a `FixedReadBufferSource`.
+
+```mermaid
+stateDiagram-v2
+  state "Iterating upstream_filters_" as ITER
+  state "Stopped at filter N" as STOP
+  [*] --> ITER : onRead()
+  ITER --> ITER : Continue,<br/>next filter
+  ITER --> STOP : StopIteration from<br/>onData() or<br/>onNewConnection()
+  STOP --> ITER : continueReading()<br/>connection buffer
+  STOP --> ITER : injectReadDataToFilterChain()<br/>caller's buffer
+  STOP --> [*] : connection<br/>closed
+  ITER --> [*] : end of chain,<br/>or connection<br/>closed
+```
+*Figure 5.2 — The two L4 statuses on the read path. `StopIteration` simply returns from
+`onContinueReading`, and either callback restarts the loop at `std::next(filter->entry())` — filter
+N+1, never N again, which is why a filter that stopped during `onNewConnection` does not see that
+buffer itself. Once the connection is closed both callbacks are no-ops: `onContinueReading` returns
+at its first line. The write path uses the same enum, resumed by `injectWriteDataToFilterChain`.
+Source:
+[`FilterStatus`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/network/filter.h#L42),
+[`FilterManagerImpl::onContinueReading`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/filter_manager_impl.cc#L62),
+[`ActiveReadFilter::continueReading`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/filter_manager_impl.h#L154),
+[`FixedReadBufferSource`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/network/filter_manager_impl.h#L50).*
 
 ## tcp_proxy: where L4 ends
 
