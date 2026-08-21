@@ -24,9 +24,8 @@ each other's way.
 A serving Envoy has one *main thread* and N *worker threads*, plus a small number
 of auxiliary threads that do not touch traffic.
 
-The main thread owns everything that is global and mutable: the configuration,
-the cluster manager, the listener manager, the admin endpoint, the stats flush
-timer, signal handling. It carries no proxied traffic: it has a connection
+The main thread owns everything that is global and mutable. It carries no
+proxied traffic: it has a connection
 handler of its own, but the only listener attached to it is the admin endpoint
 (`admin_->addListenerToHandler(handler_.get())` in
 [`InstanceBase::initializeOrThrow`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/server.cc#L464)).
@@ -36,6 +35,36 @@ bound to exactly one worker for its lifetime, and all of the state that
 connection touches — the filter chain, the codec, the connection pool it borrows
 an upstream connection from — lives on that worker and is touched only by that
 worker.
+
+```mermaid
+flowchart TD
+  subgraph MT["Main thread"]
+    LM["ListenerManagerImpl<br/>workers_ owns every WorkerImpl"]:::main
+    WI["WorkerImpl i<br/>a main-thread handle: addListener(),<br/>stopListener() only post()"]:::main
+    CMO["ClusterManagerImpl<br/>OverloadManagerImpl<br/>one instance, never copied"]:::main
+    TLI["ThreadLocal::InstanceImpl<br/>one slot per component"]:::main
+    LM -- "createWorker()" --> WI
+    CMO -- "allocateSlot()" --> TLI
+  end
+  subgraph WT["Worker thread i of N"]
+    WD["Event::Dispatcher worker_i<br/>ConnectionHandlerImpl:<br/>its listeners, its connections"]:::worker
+    COPY["ThreadLocalClusterManagerImpl<br/>ThreadLocalOverloadStateImpl<br/>one copy per thread"]:::worker
+  end
+  WI -. "start(): OS thread wrk:worker_i<br/>runs threadRoutine()" .-> WD
+  TLI -. "SlotImpl::set() posts to each dispatcher" .-> COPY
+
+  style MT fill:none,stroke:#b9b9b9,color:#444444;
+  style WT fill:none,stroke:#b9b9b9,color:#444444;
+
+  classDef main fill:#e8f0fe,stroke:#3c6cb0,color:#12325c;
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+```
+*Figure 1.1 — What the main thread owns outright, and what every worker gets a
+private copy of. Source:
+[`ProdWorkerFactory::createWorker`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/worker_impl.cc#L39),
+[`WorkerImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/worker_impl.h#L49),
+[`InstanceImpl::SlotImpl::set`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/thread_local/thread_local_impl.cc#L124),
+[`ThreadLocalClusterManagerImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/upstream/cluster_manager_impl.h#L538).*
 
 N defaults to `std::thread::hardware_concurrency()` and is set by `--concurrency`
 in [`OptionsImpl::OptionsImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/options_impl.cc#L38).
@@ -132,13 +161,44 @@ cluster manager reports every cluster initialized and the top-level init manager
 has finished — the init framework that tracks those dependencies is described in
 Chapter 2 — at which point
 [`InstanceBase::startWorkers`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/server.cc#L945)
-runs. Because that initialization usually needs the event loop to make progress,
-`run()` enters `dispatcher_->run(RunType::Block)` immediately after constructing
-the `RunHelper` and the worker start happens from inside that loop; the main
-thread then stays there until `shutdown()` calls `exit()`. Interested parties can observe the
+runs. That initialization usually needs the event loop to make progress, which is
+why the worker start happens from inside the main dispatch loop rather than
+before it; the main thread then stays in that loop until `shutdown()` calls
+`exit()`. Interested parties can observe the
 transitions through the
 [`ServerLifecycleNotifier`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/server/lifecycle_notifier.h#L11)
 stages `Startup`, `PostInit`, and `ShutdownExit`.
+
+```mermaid
+flowchart TD
+  MC(("main()<br/>MainCommon::main")):::main
+  SI["StrippedMainBase::init<br/>createFunction() builds InstanceImpl"]:::main
+  IO["InstanceBase::initializeOrThrow<br/>ListenerManagerImpl ctor,<br/>createWorker() per worker"]:::main
+  RS["MainCommonBase::run<br/>StrippedMainBase::runServer()"]:::main
+  IR["InstanceBase::run<br/>RunHelper ctor: signals,<br/>overload start, setInitializedCb()"]:::main
+  DR["Dispatcher::run(RunType::Block)<br/>on main_thread"]:::main
+  CB["clusters initialized:<br/>init manager, then init_watcher_"]:::main
+  SW["PostInit stage, then<br/>InstanceBase::startWorkers"]:::main
+  LSW["ListenerManagerImpl::startWorkers<br/>blocks on absl::BlockingCounter"]:::main
+  WS["WorkerImpl::start<br/>createThread wrk:worker_i"]:::main
+  TR["WorkerImpl::threadRoutine<br/>Dispatcher::run(RunType::Block)"]:::worker
+
+  MC -- "MainCommonBase ctor" --> SI -- "initialize()" --> IO
+  MC -- "run()" --> RS --> IR --> DR
+  DR -. "cm's initialized cb fires" .-> CB
+  CB -. "post_init_cb" .-> SW
+  SW --> LSW --> WS
+  WS -.->|"createThread()"| TR
+  TR -. "cb() decrements" .-> LSW
+
+  classDef main fill:#e8f0fe,stroke:#3c6cb0,color:#12325c;
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+```
+*Figure 1.2 — From `main()` to a worker blocked in its own dispatch loop. Source:
+[`MainCommon::main`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/exe/main_common.cc#L158),
+[`InstanceBase::run`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/server.cc#L1066),
+[`ListenerManagerImpl::startWorkers`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_manager_impl.cc#L1065),
+[`WorkerImpl::threadRoutine`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/worker_impl.cc#L168).*
 
 ## Main thread and workers: shared nothing
 
@@ -324,16 +384,32 @@ Before that, the child pulls the parent's counters and gauges and merges them, s
 that a hot restart does not look like a counter reset to a monitoring system (see
 [Chapter 13](./13-observability-and-operations.md)).
 
+```mermaid
+sequenceDiagram
+  participant P as Parent, epoch N
+  participant C as Child, epoch N+1
+  C->>P: shutdown_admin<br/>sendParentAdminShutdownRequest
+  P-->>C: original start time<br/>parent closes admin, stops flushing stats
+  C->>P: pass_listen_socket<br/>duplicateParentListenSocket
+  P-->>C: fd<br/>getListenSocketsForChild
+  Note over C: workers start on the<br/>inherited sockets
+  loop each stats flush
+    C->>P: stats, from getParentStats
+    P-->>C: counters and gauges<br/>exportStatsToChild
+  end
+  C->>P: drain_listeners<br/>drainParentListeners
+  Note over P: InstanceBase::drainListeners:<br/>stopListeners + startDrainSequence
+  Note over C: startParentShutdownSequence<br/>arms parent_shutdown_timer_
+  C->>P: terminate<br/>sendParentTerminateRequest
+  Note over P: kill(getpid(), SIGTERM)<br/>handler calls shutdown()
 ```
-  parent (epoch N)                  child (epoch N+1)
-  ----------------                  -----------------
-  listening, serving   <--- pass_listen_socket ---   startup
-                       ---- fd ------------------>   bind/listen
-                                                     workers start
-  stop accepting       <--- drain_listeners -----
-  draining connections <--- stats (merged) ------
-  exit                 <--- terminate ----------    (after parent_shutdown_time)
-```
+*Figure 1.3 — The overlap between two Envoy processes: the parent's admin goes
+first, then sockets across, stats across, then the parent exits. Source:
+[`HotRestartingChild::duplicateParentListenSocket`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/hot_restarting_child.cc#L127),
+[`Internal::shutdownAdmin`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/hot_restarting_parent.cc#L128),
+[`HotRestartingParent::onSocketEvent`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/hot_restarting_parent.cc#L64),
+[`InstanceBase::startWorkers`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/server.cc#L945),
+[`DrainManagerImpl::startParentShutdownSequence`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/server/drain_manager_impl.cc#L218).*
 
 The `SHMEM_FLAGS_INITIALIZING` bit in the shared region guards against a third
 process starting while the second is still initializing, and every

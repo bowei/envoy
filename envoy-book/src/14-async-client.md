@@ -62,9 +62,9 @@ and call `router_.setDecoderFilterCallbacks(*this)` at the end of its constructo
 then does little more than call `router_.decodeHeaders`,
 and responses arrive through `encodeHeaders`/`encodeData`/`encodeTrailers`, which
 forward to the caller's callbacks. Everything the router does from
-there — cluster lookup, load balancing, the connection pools, retries, per-try
-timeouts, outlier reporting — is the code [Chapter 8](./08-upstream.md) describes,
-on the same pools serving downstream traffic.
+there — load balancing, retries, per-try timeouts, outlier reporting — is the code
+[Chapter 8](./08-upstream.md) describes, on the same pools serving downstream
+traffic.
 
 Three things are fabricated. The route is a
 [`NullRouteImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/null_route_impl.h#L234) built
@@ -78,6 +78,65 @@ constructor builds one with dynamic stats on, every other flag off, and the stat
 prefix `http.async-client`, unless the caller overrides it with `setFilterConfig`.
 And the `StreamInfo` is fresh, declared HTTP/1.1 regardless of what the upstream
 negotiates.
+
+```mermaid
+flowchart TD
+  CL["Downstream client"]:::ext
+  CAW["ext_authz, a tracer"]:::worker
+  CAM["an xDS mux"]:::main
+  CAW ~~~ CAM
+  AC["AsyncClientImpl<br/>one per cluster, per thread"]
+
+  subgraph REAL["A real downstream stream"]
+    CM["ConnectionManagerImpl<br/>ActiveStream + FilterManager"]:::worker
+    DF["ActiveStreamDecoderFilter<br/>StreamDecoderFilterCallbacks<br/>route from the route table"]:::worker
+  end
+
+  subgraph SYN["Fabricated per stream"]
+    AS["AsyncStreamImpl<br/>StreamDecoderFilterCallbacks<br/>route is a NullRouteImpl"]
+  end
+
+  subgraph SHARED["Shared with proxied traffic"]
+    RF["Router::ProdFilter"]:::upstream
+    TLC["ThreadLocalCluster"]:::upstream
+    POOL["HttpConnPool<br/>ThreadLocalCluster::httpConnPool()"]:::upstream
+    UR["UpstreamRequest"]:::upstream
+  end
+  UH["Upstream host"]:::ext
+
+  CL == "request bytes" ==> CM
+  CM -- "decodeHeaders()" --> DF
+  CAW & CAM -- "httpAsyncClient()" --> AC
+  AC -- "create()" --> AS
+  DF & AS -- "decodeHeaders()" --> RF
+  RF -- "getThreadLocalCluster()" --> TLC
+  RF -- "acceptHeadersFromRouter()" --> UR
+  UR -- "newStream()" --> POOL
+  POOL == "request bytes" ==> UH
+
+  style REAL fill:none,stroke:#b9b9b9,color:#444444;
+  style SYN fill:none,stroke:#b9b9b9,color:#444444;
+  style SHARED fill:none,stroke:#b9b9b9,color:#444444;
+  classDef plain fill:#ffffff,stroke:#7a7a7a,color:#222222;
+  class AC,AS plain;
+
+  classDef main fill:#e8f0fe,stroke:#3c6cb0,color:#12325c;
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef upstream fill:#fdf0e3,stroke:#b8762a,color:#553312;
+  classDef ext fill:#f5f5f5,stroke:#8a8a8a,color:#333333,stroke-dasharray:4 3;
+```
+*Figure 14.1 — Two ways to reach the same router filter. Only the callbacks object
+and the route are fabricated; from `decodeHeaders()` down, the async stream is
+running the code every proxied request runs. The async client is uncoloured
+because it lives on whichever thread asked for it — a worker for a filter, the
+main thread for xDS — and the shared region is orange for the same reason: it
+marks the upstream side, not a thread, which is why Figure 8.1 draws the same
+`ThreadLocalCluster` green. Source:
+[`FilterManager::decodeHeaders`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L592),
+[`AsyncStreamImpl::sendHeaders`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/async_client_impl.cc#L235),
+[`NullRouteImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/null_route_impl.h#L234),
+[`Filter::decodeHeaders`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L477),
+[`UpstreamRequest::acceptHeadersFromRouter`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_request.cc#L412).*
 
 Lifetime follows the usual rules: streams live in a list on the client,
 [`cleanup`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/async_client_impl.cc#L343) unlinks

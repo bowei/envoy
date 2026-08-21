@@ -38,11 +38,48 @@ A state-of-the-world update carries the complete set of resources of that type; 
 
 ## Four more, and one on demand
 
-The same shape repeats for four services the list above leaves out, and the useful question for each is which object owns the subscription. RTDS delivers runtime layers: one [`RtdsSubscription`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/runtime/runtime_impl.h#L175) per `rtds_layer` in the bootstrap, owned by the runtime loader, so feature flags move without touching listeners. SRDS delivers scoped route tables and is owned by [`ScopedRdsConfigSubscription`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/scoped_rds.h#L109), which stands up an RDS route config provider per scope. VHDS delivers individual virtual hosts on demand, for route tables too large to ship whole; its [`VhdsSubscription`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/vhds.h#L39) hangs off the RDS subscription that owns the route config (see [Chapter 7](./07-routing.md)). Of those two, only SRDS sits on the generic provider framework in [`config_provider_impl.h`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/config/config_provider_impl.h), whose [`ConfigSubscriptionCommonBase`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/config/config_provider_impl.h#L143) holds the thread-local slot workers read; RDS and VHDS use the separate provider machinery under `source/common/rds/`.
+The same shape repeats for four services the list above leaves out, and the useful question for each is which object owns the subscription. RTDS delivers runtime layers: one [`RtdsSubscription`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/runtime/runtime_impl.h#L175) per `rtds_layer` in the bootstrap, owned by the runtime loader, so feature flags move without touching listeners. SRDS delivers scoped route tables and is owned by [`ScopedRdsConfigSubscription`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/scoped_rds.h#L109). VHDS delivers individual virtual hosts on demand, for route tables too large to ship whole; its [`VhdsSubscription`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/vhds.h#L39) hangs off the RDS subscription that owns the route config (see [Chapter 7](./07-routing.md)). Of those two, only SRDS sits on the generic provider framework in [`config_provider_impl.h`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/config/config_provider_impl.h), whose [`ConfigSubscriptionCommonBase`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/config/config_provider_impl.h#L143) holds the thread-local slot workers read; RDS and VHDS use the separate provider machinery under `source/common/rds/`.
 
 ECDS is the one that answers a question the extension framework raises directly: can a filter's configuration change without an LDS update? A filter entry carries `config_discovery` — an `ExtensionConfigSource` — instead of `typed_config`, and [`FilterChainHelper::processDynamicFilterConfig`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_chain_helper.h#L130) pushes a *dynamic* config provider onto the filter list where a static filter would have contributed a provider wrapping an already-resolved factory callback (see [Chapter 3](./03-extension-framework.md)). The resource type is `TypedExtensionConfig`, and one [`FilterConfigSubscription`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/filter/config_discovery_impl.h#L421) per config-source-and-name pair — the map key is a hash of the config source plus the filter name — is shared by every filter chain that names it. Each user holds a [`DynamicFilterConfigProviderImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/filter/config_discovery_impl.h#L70) whose `config()` reads a thread-local `std::optional<FactoryCb>`, republished to every worker on update. Because [`FilterChainUtility::createFilterChainForFactories`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_chain_helper.cc#L18) asks the provider for its callback each time it builds a chain, no listener is drained: the next stream gets the new filter, and a provider with no config yet contributes a stub filter that returns 500. `type_urls` bounds what the control plane may send; `default_config` is what the provider serves before a response arrives, and `apply_default_config_without_warming` decides whether the listener waits for one.
 
 On-demand delivery inverts the flow: [`OdCdsApiImpl::updateOnDemand`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/upstream/od_cds_api_impl.cc#L104) asks for a single cluster by name when a route needs one the manager does not have, which works only over delta.
+
+```mermaid
+flowchart TD
+  LDS["LDS<br/>Listener<br/>from bootstrap"]:::config
+  ECDS["ECDS<br/>TypedExtensionConfig"]:::config
+  SRDS["SRDS<br/>ScopedRouteConfiguration"]:::config
+  RDS["RDS<br/>RouteConfiguration"]:::config
+  VHDS["VHDS<br/>VirtualHost<br/>on demand"]:::config
+  CDS["CDS<br/>Cluster<br/>from bootstrap"]:::config
+  ODCDS["ODCDS<br/>Cluster<br/>on demand"]:::config
+  EDS["EDS<br/>ClusterLoadAssignment"]:::config
+  SDS["SDS<br/>Secret"]:::config
+
+  LDS -- "config_discovery" --> ECDS
+  LDS -- "scoped_routes" --> SRDS
+  LDS -- "rds" --> RDS
+  SRDS -. "route_configuration_name" .-> RDS
+  RDS -- "vhds" --> VHDS
+  RDS -. "route.cluster, per request" .-> CDS
+  RDS -. "cluster absent, on_demand filter" .-> ODCDS
+  CDS -- "eds_cluster_config" --> EDS
+  CDS -- "sds_secret_config" --> SDS
+  LDS -- "sds_secret_config" --> SDS
+
+  classDef config fill:#f3ebfa,stroke:#7a4fa3,color:#341a4d;
+```
+*Figure 2.1 — Which resource pulls in which. Only LDS and CDS name a config
+source in `dynamic_resources`; every other subscription is opened by a resource
+already accepted. A solid edge is a config source embedded in the parent
+resource, so accepting the parent opens the child's subscription; a dotted edge
+is a bare name resolved later, at the next scope update or at request time.
+Source:
+[`HttpConnectionManagerConfig`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/extensions/filters/network/http_connection_manager/config.cc#L55),
+[`FilterConfigSubscription::start`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/filter/config_discovery_impl.cc#L102),
+[`SecretManagerImpl::findOrCreateTlsCertificateProvider`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/secret/secret_manager_impl.cc#L130),
+[`EdsClusterImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/extensions/clusters/eds/eds.cc#L28),
+[`OdCdsApiImpl::updateOnDemand`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/upstream/od_cds_api_impl.cc#L104).*
 
 ## Choosing a transport
 
@@ -82,20 +119,58 @@ Startup is a chain of these, and it is what the worker-start sequencing in [Chap
 
 Listener warming reuses the same machinery, with a twist that depends on whether workers are running. Each [`ListenerImpl`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_impl.h#L208) — the main-thread object that also owns the listen sockets and the filter chain manager, both of which are [Chapter 4](./04-accept-path.md)'s subject — owns a `dynamic_init_manager_` plus two hooks: a `listener_init_target_` registered with the *server's* init manager, and a `local_init_watcher_` fired when the listener's own targets complete.
 
-```
- workers not started            workers started
- -----------------------        ------------------------------
- listener_init_target_          ListenerImpl::initialize()
-   registered on server IM        -> dynamic_init_manager_->initialize()
- server IM drives warming       local_init_watcher_ fires
- local_init_watcher_ fires        -> onListenerWarmed()
-   -> listener_init_target_       -> add to each worker
-        .ready()                  -> swap into active_listeners_
- listener goes straight into     -> drainListener(old)
-   active_listeners_
-```
+[`ListenerManagerImpl::addOrUpdateListenerInternal`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_manager_impl.cc#L594) hashes the config, short-circuits if it is unchanged, and puts the new listener in `warming_listeners_` if workers are running and `active_listeners_` if not. When warming finishes, [`ListenerManagerImpl::onListenerWarmed`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_manager_impl.cc#L865) hands the listener to every worker, promotes it, and passes the listener it replaced to [`ListenerManagerImpl::drainListener`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_manager_impl.cc#L728), which stops accepting and notifies existing connections so codecs can react before the drain timer expires. An LDS update therefore never drops a connection and never leaves a half-configured listener accepting traffic.
 
-[`ListenerManagerImpl::addOrUpdateListenerInternal`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_manager_impl.cc#L594) hashes the config, short-circuits if it is unchanged, and puts the new listener in `warming_listeners_` if workers are running and `active_listeners_` if not. When warming finishes, [`ListenerManagerImpl::onListenerWarmed`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_manager_impl.cc#L865) hands the listener to every worker, promotes it, and passes the listener it replaced to [`ListenerManagerImpl::drainListener`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_manager_impl.cc#L728), which stops accepting, notifies existing connections, and removes it from the workers once the drain timer expires. An LDS update therefore never drops a connection and never leaves a half-configured listener accepting traffic.
+```mermaid
+stateDiagram-v2
+  direction TB
+  [*] --> Warming : addOrUpdateListener(), workers started
+  [*] --> Active : addOrUpdateListener(), workers not started
+  Warming --> Active : onListenerWarmed() adds it to every worker
+  Warming --> Active : inPlaceFilterChainUpdate() overrides it on every worker
+  Warming --> [*] : removeListener(), or doFinalPreWorkerListenerInit() fails
+  Active --> Draining : drainListener(), replaced by a warmed listener or removed
+  Active --> [*] : removeListener() before workers start
+  Draining --> [*] : worker removeListener() after the drain sequence
+```
+*Figure 2.2 — A listener's lifecycle. Before workers start it goes straight into
+`active_listeners_`, driven by the server's init manager through
+`listener_init_target_`; afterwards each update warms in `warming_listeners_`
+first, driven by the listener's own manager. The in-place path is the exception
+to the `Draining` box: the listener it replaces goes to `drainFilterChains`, so
+only the chains that changed drain and the socket never stops accepting. Source:
+[`ListenerManagerImpl::addOrUpdateListenerInternal`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_manager_impl.cc#L594),
+[`ListenerManagerImpl::onListenerWarmed`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_manager_impl.cc#L865),
+[`ListenerManagerImpl::inPlaceFilterChainUpdate`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_manager_impl.cc#L899),
+[`ListenerManagerImpl::removeListenerInternal`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/listener_manager_impl.cc#L999).*
+
+```mermaid
+stateDiagram-v2
+  direction TB
+  state "Init::Manager" as MGR {
+    [*] --> Uninitialized
+    Uninitialized --> Initializing : initialize(watcher), targets pending
+    Uninitialized --> Initialized : initialize(watcher), no targets
+    Initializing --> Initializing : add() starts a late target at once
+    Initializing --> Initialized : onTargetReady() takes the count to zero
+    Initialized --> [*] : the manager's watcher fires, lifting the barrier
+  }
+  state "one Init::Target" as TGT {
+    [*] --> Pending
+    Pending --> Running : TargetHandleImpl initialize() runs the callback
+    Running --> Ready : TargetImpl ready() signals the manager watcher
+    Pending --> Ready : destroyed target, counted ready
+  }
+  MGR --> TGT : initialize() through the weak TargetHandle
+  TGT --> MGR : onTargetReady()
+```
+*Figure 2.3 — The barrier a warming listener waits behind: its manager holds one
+target per SDS secret, RDS subscription and dynamic filter config, and lifts only
+when the last of them reports ready — or is destroyed, which counts the same.
+Source:
+[`ManagerImpl::initialize`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/init/manager_impl.cc#L40),
+[`ManagerImpl::onTargetReady`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/init/manager_impl.cc#L80),
+[`TargetHandleImpl::initialize`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/init/target_impl.cc#L10).*
 
 ## Getting it to the workers
 

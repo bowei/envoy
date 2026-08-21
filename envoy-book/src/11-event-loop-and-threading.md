@@ -64,20 +64,36 @@ threaded use exactly once per process, by
 
 One iteration, documented at length above that class, looks like this:
 
+```mermaid
+flowchart TD
+  A["Step 1: poll timeout from<br/>the nearest timer deadline"]
+  B["Step 2: prepare watch callbacks"]
+  C["Step 3: poll fds"]
+  D["Step 4: check watch callbacks,<br/>updateApproximateMonotonicTime()"]
+  E["Step 5: harvest expired timers,<br/>FileEvent::activate() and<br/>scheduleCallbackNextIteration()"]
+  W[("Work list")]
+  G["Step 6: drain work list to empty"]
+  P["runPostCallbacks()"]
+  DD["clearDeferredDeleteList()"]
+  PC["Each post callback: run it,<br/>then destroy it"]
+
+  A --> B --> C --> D --> E
+  C -- "active fd events" --> W
+  E -- "expired timers" --> W
+  W --> G
+  G -. "scheduleCallbackCurrentIteration()" .-> W
+  G -- "deferred_delete_cb_" --> DD
+  G -- "post_cb_" --> P
+  P -- "clears first" --> DD
+  P -- "then" --> PC
+  G -- "step 7: next iteration" --> A
+
+  classDef plain fill:#ffffff,stroke:#7a7a7a,color:#222222;
+  class A,B,C,D,E,W,G,P,DD,PC plain;
 ```
-  compute poll timeout from nearest timer deadline
-       |
-       v  "prepare" watch callbacks
-  poll fds  ------------------------------> active fd events -> work list
-       |
-       v  "check" watch callbacks
-  move expired timers ---------------------------------------> work list
-       |
-       v
-  drain work list (items may append more work)
-       |
-       +--> next iteration
-```
+*Figure 11.1 — One iteration of the dispatch loop. Source:
+[`LibeventScheduler`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/event/libevent_scheduler.h#L59),
+[`DispatcherImpl::runPostCallbacks`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/event/dispatcher_impl.cc#L360).*
 
 The prepare/check hooks are how the dispatcher piggybacks on the loop without
 modifying it. The dispatcher constructor uses
@@ -160,6 +176,37 @@ which pushes the `unique_ptr` onto a list and arms a current-iteration callback.
 Destruction happens after the whole callback stack has unwound, still within the
 same loop iteration.
 
+```mermaid
+stateDiagram-v2
+  direction TB
+  [*] --> Alive
+  Alive --> Queued: removeFromList()<br/>deferredDelete()
+  Queued --> Destroying: clearDeferredDeleteList()<br/>from deferred_delete_cb_<br/>or from runPostCallbacks()
+  Destroying --> Freed: reset(), FIFO order
+  Freed --> [*]
+  state "Alive: in its owner's list" as Alive
+  state "Queued in current_to_delete_" as Queued
+  state "Destroying: in the swapped-out batch" as Destroying
+  state "Freed" as Freed
+  note left of Queued
+    deleteIsPending() called;
+    nothing iterates it again,
+    but its own frames are
+    still on the stack
+  end note
+  note left of Destroying
+    the stack has unwound;
+    the buffer swap already
+    happened, so a child
+    deferred here waits for
+    the next callback
+  end note
+```
+*Figure 11.2 — The life of one deferred-deleted object. Source:
+[`DispatcherImpl::deferredDelete`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/event/dispatcher_impl.cc#L249),
+[`DispatcherImpl::clearDeferredDeleteList`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/event/dispatcher_impl.cc#L119),
+[`DeferredDeletable`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/event/deferred_deletable.h#L13).*
+
 The list is double-buffered, because a destructor commonly defers-deletes its own
 children:
 
@@ -182,8 +229,7 @@ refers to a dying object fails loudly rather than intermittently.
 The canonical call site combines two mechanisms:
 [`OwnedActiveStreamListenerBase::removeConnection`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/listener_manager/active_stream_listener_base.cc#L127)
 pulls the connection out of its list with `removeFromList`, which yields the
-owning `unique_ptr`, and passes it straight to `deferredDelete`. Unlinking is
-immediate — nothing will iterate over it again — while destruction is deferred.
+owning `unique_ptr`, and passes it straight to `deferredDelete`.
 [`DeferredTaskUtil::deferredRun`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/event/deferred_task.h#L29)
 reuses the same queue to run an arbitrary function after the current batch of
 deletions, by wrapping it in an object whose destructor is the task.
@@ -217,6 +263,25 @@ old object alive until it drops its reference — read-copy-update without a rea
 lock. The two-argument overload adds a completion barrier by capturing a
 `shared_ptr` whose custom deleter posts back to the main thread once the last
 worker has dropped it.
+
+```mermaid
+sequenceDiagram
+  participant M as Main thread
+  participant W0 as Worker thread 0
+  participant W1 as Worker thread 1
+  M->>M: SlotImpl::set(cb)
+  M-->>W0: post(wrapCallback(...))
+  M-->>W1: post(wrapCallback(...))
+  M->>M: setThreadLocal(index_, cb(...))
+  Note over W0,W1: each lambda runs from its own<br/>runPostCallbacks(), after checking<br/>still_alive_guard
+  W0->>W0: setThreadLocal(index, cb(...))
+  W1->>W1: setThreadLocal(index, cb(...))
+  Note over W0,W1: the old value dies with its last holder
+```
+*Figure 11.3 — Publishing a new value into a thread-local slot. Source:
+[`SlotImpl::set`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/thread_local/thread_local_impl.cc#L124),
+[`InstanceImpl::setThreadLocal`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/thread_local/thread_local_impl.cc#L211),
+[`SlotImpl::wrapCallback`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/thread_local/thread_local_impl.cc#L73).*
 
 Slots are allocated and destroyed on the main thread only, but callbacks may be
 in flight on workers when a slot dies. Two mechanisms cover that. Every posted

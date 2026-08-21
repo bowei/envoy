@@ -17,12 +17,8 @@ destroyed.
 Response data enters through the upstream codec and lands in
 [`UpstreamCodecFilter::CodecBridge::decodeHeaders`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_codec_filter.cc#L149),
 which stamps `onFirstUpstreamRxByteReceived` and pushes the headers into the *upstream*
-filter chain's encode direction. That chain's terminal callback object is
-[`UpstreamRequestFilterManagerCallbacks`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_request.h#L272),
-whose `encodeHeaders` simply calls
-[`UpstreamRequest::decodeHeaders`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_request.cc#L295).
-The naming inverts because `UpstreamRequest` implements `Http::ResponseDecoder` through the
-legacy [`UpstreamToDownstream`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/router/router.h#L1560) interface: what
+filter chain's encode direction. The naming inverts because `UpstreamRequest`
+implements `Http::ResponseDecoder` through the legacy [`UpstreamToDownstream`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/router/router.h#L1560) interface: what
 the upstream chain encodes, the upstream request decodes.
 
 `UpstreamRequest::decodeHeaders` rearms the per-try idle timer, drops unsupported 1xx
@@ -35,6 +31,41 @@ critically — calls
 [`Filter::resetOtherUpstreams`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L1822)
 to kill any sibling attempts before forwarding. Only then does it call
 `callbacks_->encodeHeaders`, crossing from the router into the downstream encoder chain.
+
+```mermaid
+flowchart TD
+  UC["Upstream codec"]:::upstream
+  CB["UpstreamCodecFilter::CodecBridge<br/>decodeHeaders()"]:::upstream
+  UFC["Upstream filter chain<br/>encode direction"]:::upstream
+  URC["UpstreamRequestFilterManagerCallbacks<br/>encodeHeaders()"]:::upstream
+  UR["UpstreamRequest::decodeHeaders"]:::upstream
+  OH["Filter::onUpstreamHeaders<br/>resetOtherUpstreams() first"]:::upstream
+  DF["ActiveStreamDecoderFilter<br/>encodeHeaders()"]:::worker
+  FM["FilterManager::encodeHeaders<br/>filters in reverse config order"]:::worker
+  ME["FilterManager::maybeEndEncode"]:::worker
+  AS["ActiveStream::encodeHeaders"]:::worker
+  CL["Downstream client"]:::ext
+
+  UC == "response headers" ==> CB
+  CB -- "encodeHeaders()" --> UFC --> URC
+  URC -- "decodeHeaders()" --> UR --> OH
+  OH -- "encodeHeaders()" --> DF --> FM
+  FM -- "filter_manager_callbacks_" --> AS
+  FM -- "then" --> ME
+  AS == "response_encoder_" ==> CL
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef upstream fill:#fdf0e3,stroke:#b8762a,color:#553312;
+  classDef ext fill:#f5f5f5,stroke:#8a8a8a,color:#333333,stroke-dasharray:4 3;
+```
+*Figure 9.1 — One response, two filter managers. Unlike the decode direction, the
+encode direction has no terminal filter — the upstream chain ends in a callback
+object and the downstream chain ends at the codec — and its filters run in the
+reverse of config order. Source:
+[`UpstreamCodecFilter::CodecBridge::decodeHeaders`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_codec_filter.cc#L149),
+[`UpstreamRequestFilterManagerCallbacks::encodeHeaders`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_request.h#L278),
+[`FilterManager::encodeHeaders`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L1314),
+[`StreamEncoderFilters`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.h#L96).*
 
 Body and trailers are simpler:
 [`Filter::onUpstreamData`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L2046) and
@@ -78,9 +109,7 @@ where the failure is known to be a handshake problem and waiting buys nothing.
 
 A decision to retry is not permission to retry. That gate is
 [`RetryStateImpl::shouldRetry`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/retry_state_impl.cc#L269),
-which decrements the remaining-tries counter, then asks the cluster's resource manager
-whether another concurrent retry may be created, then checks the `upstream.use_retry`
-runtime key. Its answer is one of five values:
+whose answer is one of five values:
 
 ```cpp
 enum class RetryStatus {
@@ -108,6 +137,43 @@ it. The callback lands in
 [`Filter::doRetry`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L2363), which bumps the
 attempt count, re-resolves the cluster (CDS can have removed it mid-stream), selects a new
 host and builds a fresh `UpstreamRequest`.
+
+```mermaid
+stateDiagram-v2
+  state "UpstreamRequest<br/>in flight" as Attempt
+  state "Filter::onUpstreamHeaders" as Hdrs
+  state "Filter::maybeRetryReset" as Rst
+  state "RetryStateImpl::shouldRetry" as Gate
+  state "retry timer armed" as Backoff
+  state "Filter::doRetry<br/>builds a fresh attempt" as Do
+  state "response forwarded, or<br/>local reply via<br/>onUpstreamAbort" as Done
+
+  [*] --> Attempt
+  Attempt --> Hdrs : response headers
+  Attempt --> Rst : reset, or unhedged<br/>per-try timeout
+  Attempt --> Done : route timeout,<br/>onResponseTimeout()
+  Hdrs --> Gate : shouldRetryHeaders()
+  Rst --> Gate : shouldRetryReset()
+  Rst --> Done : response started,<br/>or already retried
+  Gate --> Backoff : RetryWithBackoff
+  Gate --> Do : RetryImmediately
+  Backoff --> Do : timer fires
+  Do --> Attempt
+  Gate --> Done : No, NoOverflow,<br/>NoRetryLimitExceeded,<br/>NoRuntime
+  Done --> [*]
+```
+*Figure 9.2 — The retry state machine. Both entry points reach the same gate, but
+`maybeRetryReset` can refuse before it: once the response has started, or this
+attempt has already been retried, there is no second chance. `RetryImmediately`
+skips the backoff timer but still costs a dispatcher iteration, and a refused
+retry becomes a response flag on the forwarded response or on the local reply.
+Hedging is the one path not drawn — it enters the same gate through
+`shouldHedgeRetryPerTryTimeout` without ending the first attempt. Source:
+[`RetryStateImpl::shouldRetry`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/retry_state_impl.cc#L269),
+[`RetryStateImpl::enableBackoffTimer`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/retry_state_impl.cc#L158),
+[`Filter::maybeRetryReset`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L1574),
+[`Filter::onPerTryTimeoutCommon`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L1448),
+[`Filter::doRetry`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L2363).*
 
 Host selection for a retry is itself pluggable.
 [`RetryHostPredicate`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/upstream/retry.h#L75) implementations veto
@@ -142,8 +208,7 @@ header is present, then hands that header to
 [`convertRequestHeadersForInternalRedirect`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L2197).
 That function checks the budget first — a `num_internal_redirects` counter kept in the
 stream's filter state at `LifeSpan::Request` and compared against `maxInternalRedirects()`
-— then rewrites scheme, host and path on `downstream_headers_`, clears the route cache and
-re-resolves the route, and asks every
+— and asks every
 [`InternalRedirectPredicate`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/envoy/router/internal_redirect.h#L17)
 whether the new route is acceptable — the shipped ones are
 [`PreviousRoutesPredicate`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/extensions/internal_redirect/previous_routes/previous_routes.h#L12),
@@ -154,6 +219,38 @@ and save the original scheme, host and path in `x-envoy-original-url`; a `Cleanu
 the untouched headers on every earlier exit. Each rejection reason has its own
 `passthrough_internal_redirect_*` counter, and any of them means the 3xx is simply proxied
 downstream.
+
+```mermaid
+flowchart TD
+  OH["Filter::onUpstreamHeaders<br/>3xx with Location"]:::upstream
+  SR["Filter::setupRedirect"]:::upstream
+  CV["convertRequestHeadersForInternalRedirect()"]:::upstream
+  PT["3xx proxied downstream,<br/>passthrough counter incremented"]:::worker
+  RS["ActiveStreamDecoderFilter::recreateStream"]:::worker
+  AR["ActiveStream::recreateStream"]:::worker
+  OLD["old stream: doEndStream()<br/>is_internally_destroyed_"]:::worker
+  NEW["new stream: newStream()<br/>is_internally_created_"]:::worker
+  DEC["new_stream.decodeHeaders(),<br/>decodeData() if a body was buffered"]:::worker
+  KEEP[("carried across: same ResponseEncoder,<br/>request_headers_, buffered request body,<br/>filter state at LifeSpan::Request,<br/>setFromForRecreateStream fields")]:::worker
+
+  OH --> SR --> CV
+  CV -- "false" --> PT
+  CV -- "true" --> RS
+  RS -- "filter_manager_callbacks_" --> AR
+  AR -- "first" --> OLD
+  OLD -- "then" --> NEW --> DEC
+  DEC -- "reuses" --> KEEP
+
+  classDef worker fill:#e9f6ec,stroke:#3f8f56,color:#14401f;
+  classDef upstream fill:#fdf0e3,stroke:#b8762a,color:#553312;
+```
+*Figure 9.3 — An internal redirect replays the downstream half of the request. The
+old stream is torn down and a new one is created on the same `ResponseEncoder`, so
+the client never sees the swap. Source:
+[`Filter::setupRedirect`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L2168),
+[`Filter::convertRequestHeadersForInternalRedirect`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L2197),
+[`ActiveStreamDecoderFilter::recreateStream`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L1890),
+[`ActiveStream::recreateStream`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_manager_impl.cc#L2525).*
 
 The stream swap itself is
 [`ActiveStreamDecoderFilter::recreateStream`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/filter_manager.cc#L1890),
@@ -191,14 +288,25 @@ the dynamic-modules ABI exposes it to out-of-tree filters as well.
 A proxied stream runs under several independent clocks, armed by different owners.
 
 ```
-downstream                                             upstream
-  |--- request headers -------------------------------------->|
-  |  [stream idle timeout]      ActiveStream                   |
-  |  [request timeout]          ActiveStream                   |
-  |  [max stream duration]      ActiveStream                   |
-  |                             [route timeout]   Router::Filter
-  |                             [per-try timeout] UpstreamRequest
+  t0                      t1                              t2
+  stream created          request complete                response done
+  |                       |                               |
+  |<================ max stream duration ================>| ActiveStream
+  |<-- request timeout -->|                               | ActiveStream
+  |                       |<------- route timeout ------->| Router::Filter
+  |                       |<-- per-try -->|<-- per-try -->| UpstreamRequest
+  |                       |  attempt 1    |  attempt 2    |
+
+  stream idle timeout: no span -- rearmed on every byte in either
+  direction, so it fires only on a gap (and it is a scaled timer)
 ```
+*Figure 9.4 — Five clocks on one stream, and which contains which. The three
+downstream ones start at t0; a per-try timer belongs to one attempt and is armed
+at pool readiness, or at t1 if the request is still arriving. Source:
+[`ActiveStream`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/http/conn_manager_impl.cc#L895),
+[`FilterUtility::finalTimeout`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L180),
+[`Filter::onRequestComplete`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/router.cc#L1309),
+[`UpstreamRequest::setupPerTryTimeout`](https://github.com/envoyproxy/envoy/blob/981d3923fed302ab44ee9fd265fb078d4aabbd85/source/common/router/upstream_request.cc#L558).*
 
 The downstream three are created in the `ActiveStream` constructor. The stream idle timer
 is a *scaled* timer, so the overload manager can shrink it under pressure; rearmed on

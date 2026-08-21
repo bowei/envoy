@@ -1,1 +1,3 @@
 book
+.tools/__pycache__
+.tools/.symbol_cache.json
