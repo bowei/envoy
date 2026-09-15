@@ -1,0 +1,90 @@
+# Envoy view
+
+Envoy view connects to an Envoy server and downloads the xDS configuration.
+
+It then displays all the xDS in a way that is easily consumable for a human by
+mapping it into a graph of filter chain pipelines. This will be a Web-based UI
+with the nodes being Envoy stages linked with the appropriate xDS configuration.
+
+## Implementation nodes
+
+* Implement in go-lang server that connects to the Envoy server.
+* UI runs as a website hosted by the server.
+
+## Demo
+
+If you have a container runtime and just want to see it work:
+
+    make demo
+
+That boots a demo Envoy in a container, starts envoy-view against it, and
+opens the UI. Ctrl-C stops both; nothing is left behind. `demo/run.sh
+--print` renders the same graph to stdout instead, with no UI.
+
+The demo config in `demo/` is picked to put one of every interesting shape
+on the canvas: a weighted route splitting 80/20, an EDS cluster reporting
+2 of 3 endpoints healthy, a TCP proxy chain, and one route pointing at a
+cluster that does not exist, which is the red node the problems panel
+jumps to. Editing `demo/rds.yaml` and hitting Refresh shows a live RDS
+update landing in the graph.
+
+## Running it
+
+    go build -o envoy-view ./cmd/envoy-view
+    ./envoy-view -envoy-admin 127.0.0.1:9901
+
+Then open http://127.0.0.1:8080. The web UI is compiled into the binary,
+so a build needs no npm.
+
+The server fetches `/config_dump` from the Envoy admin interface on demand
+and keeps the result as a browsable snapshot; "Refresh" takes a new one.
+Nothing is pushed or written back to Envoy — this is read-only.
+
+To look at a dump captured elsewhere, pass it on the command line or drag
+the file onto the page:
+
+    curl -s localhost:9901/config_dump?include_eds > dump.json
+    ./envoy-view -dump-file dump.json
+
+Useful flags (`-h` for the rest):
+
+| flag | default | |
+| --- | --- | --- |
+| `-addr` | `127.0.0.1:8080` | where to serve the UI |
+| `-envoy-admin` | `127.0.0.1:9901` | Envoy's admin interface |
+| `-dump-file` | | read a saved dump instead of querying Envoy |
+| `-print` | | render `summary` or `graph` to stdout and exit |
+
+The Envoy admin interface is unauthenticated and exposes secrets and
+private keys, so `-addr` binds to localhost by default. Reach a remote
+Envoy over an SSH tunnel rather than exposing either port.
+
+## Reading the graph
+
+Pipelines flow left to right: listener → filter chain → filters → route
+configuration → virtual host → route → cluster → endpoints. Every node
+is a real xDS resource; clicking one opens its config dump entry, with
+the version and the time Envoy last updated it.
+
+A red border means the graph builder found a problem — a route pointing
+at a cluster that is not in the dump, a rejected update, an EDS cluster
+with no endpoints. The problems panel at the bottom lists them all and
+jumps to each one. Press `/` to search by name.
+
+## Development
+
+    make ui             # rebuild the embedded UI (needs npm)
+    make build          # compile the binary
+    make test           # Go tests, then UI tests and typecheck
+    make test-short     # skip the container scenarios
+    make test-container # boot a real Envoy and test against it
+    make ui-dev         # Vite dev server with hot reload, proxying /api
+
+`internal/envoytest` runs the pinned Envoy release in a container and feeds
+its real config dump to the parser, so the fixtures are transcripts rather
+than guesses. Those tests skip when no container runtime is present.
+See `docs/testing-plan.md`.
+
+`internal/webui/dist` is committed, so `make ui` is only needed after
+changing anything under `web/`. Because `go:embed` bakes it in at compile
+time, always rebuild the binary after rebuilding the UI.

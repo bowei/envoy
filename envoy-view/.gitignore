@@ -1,0 +1,9 @@
+/envoy-view
+/web/node_modules/
+/.claude/settings.local.json
+/.claude/worktrees/
+
+# Scratch directory for headless-browser screenshots taken while developing the
+# UI. internal/webui/dist is deliberately NOT ignored: it is committed so
+# "go install" works without npm.
+/.shots/

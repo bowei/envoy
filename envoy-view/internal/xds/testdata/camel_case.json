@@ -1,0 +1,75 @@
+{
+ "configs": [
+  {
+   "@type": "type.googleapis.com/envoy.admin.v3.ListenersConfigDump",
+   "versionInfo": "7",
+   "dynamicListeners": [
+    {
+     "name": "camel_listener",
+     "activeState": {
+      "versionInfo": "7",
+      "listener": {
+       "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
+       "name": "camel_listener",
+       "address": {
+        "socketAddress": {
+         "address": "0.0.0.0",
+         "portValue": 8080
+        }
+       },
+       "filterChains": [
+        {
+         "filters": [
+          {
+           "name": "envoy.filters.network.tcp_proxy",
+           "typedConfig": {
+            "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+            "statPrefix": "camel",
+            "cluster": "camel_cluster"
+           }
+          }
+         ]
+        }
+       ]
+      },
+      "lastUpdated": "2026-09-14T12:00:00Z"
+     }
+    }
+   ]
+  },
+  {
+   "@type": "type.googleapis.com/envoy.admin.v3.ClustersConfigDump",
+   "dynamicActiveClusters": [
+    {
+     "versionInfo": "7",
+     "cluster": {
+      "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+      "name": "camel_cluster",
+      "type": "STATIC",
+      "connectTimeout": "1s",
+      "loadAssignment": {
+       "clusterName": "camel_cluster",
+       "endpoints": [
+        {
+         "lbEndpoints": [
+          {
+           "endpoint": {
+            "address": {
+             "socketAddress": {
+              "address": "10.9.9.9",
+              "portValue": 80
+             }
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     },
+     "lastUpdated": "2026-09-14T12:00:00Z"
+    }
+   ]
+  }
+ ]
+}

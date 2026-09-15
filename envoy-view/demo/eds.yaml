@@ -1,0 +1,16 @@
+# Endpoints for the "catalog" cluster, delivered over filesystem EDS.
+#
+# Only the first endpoint is a real address. The other two exist to make the
+# health count on the endpoints node interesting: Envoy reports an endpoint
+# delivered with no health_status as HEALTHY, so the node reads "2/3 healthy".
+version_info: "1"
+resources:
+  - "@type": type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment
+    cluster_name: catalog
+    endpoints:
+      - locality: { region: us-west1, zone: us-west1-a }
+        lb_endpoints:
+          - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 8081 } } }
+          - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 9101 } } }
+            health_status: UNHEALTHY
+          - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 9102 } } }

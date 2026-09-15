@@ -1,0 +1,141 @@
+# Bootstrap for the envoy-view demo. Nothing here is required by envoy-view;
+# it is a config picked to put one of every interesting shape on the canvas.
+#
+# Three listeners:
+#   ingress_http  :10000  the pipeline the demo is about, routes over RDS
+#   tcp_ingress   :10001  a TCP proxy, to show a non-HTTP chain
+#   demo_backend  :8081   container-internal, answers so the graph has traffic
+#
+# The upstreams are all demo_backend, so the demo needs no second container.
+node:
+  id: envoy-view-demo
+  cluster: demo
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    # The route table arrives over filesystem RDS rather than inline, for two
+    # reasons: it makes the route config a resource of its own with its own
+    # version (which is what the detail pane shows), and RDS defaults
+    # validate_clusters to false, which is what lets rds.yaml keep a route
+    # pointing at a cluster that does not exist. Inline, Envoy would reject
+    # the listener instead.
+    - name: ingress_http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - name: http
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                rds:
+                  route_config_name: ingress_routes
+                  config_source:
+                    path_config_source: { path: /etc/envoy/rds.yaml }
+                    resource_api_version: V3
+                http_filters:
+                  - name: envoy.filters.http.cors
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+
+    - name: tcp_ingress
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10001 }
+      filter_chains:
+        - name: raw
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: tcp_ingress
+                cluster: tcp_backend
+
+    # Bound to the loopback inside the container and never published, so it is
+    # only reachable as an upstream of the two listeners above.
+    - name: demo_backend
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 8081 }
+      filter_chains:
+        - name: backend
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: backend
+                route_config:
+                  name: backend_routes
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: / }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "hello from the demo backend\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: service_a
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: service_a
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 8081 } } }
+
+    - name: service_canary
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: service_canary
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 8081 } } }
+
+    - name: service_b
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: service_b
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 8081 } } }
+
+    - name: tcp_backend
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: tcp_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 8081 } } }
+
+    # Endpoints come from eds.yaml, so this cluster gets its own endpoints node
+    # on the canvas with a health count rather than an inline endpoint list.
+    - name: catalog
+      type: EDS
+      connect_timeout: 1s
+      eds_cluster_config:
+        eds_config:
+          path_config_source: { path: /etc/envoy/eds.yaml }
+          resource_api_version: V3
+
+    # There is deliberately no "legacy_payments" cluster. rds.yaml routes
+    # /legacy to it; that dangling reference is what the red node and the
+    # problems panel in the UI are showing.
